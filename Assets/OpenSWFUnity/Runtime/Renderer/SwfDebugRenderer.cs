@@ -65,6 +65,61 @@ namespace OpenSWFUnity.Runtime.Renderer
             );
         }
 
+        public void DrawFillContours(DefineShapeTag shape, SwfMatrix matrix, string name)
+        {
+            if (shape == null || shape.ShapeData == null || shape.ShapeData.FillEdgeGroups == null)
+                return;
+
+            for (int g = 0; g < shape.ShapeData.FillEdgeGroups.Count; g++)
+            {
+                SwfFillEdgeGroup group = shape.ShapeData.FillEdgeGroups[g];
+
+                if (group == null || group.Contours == null)
+                    continue;
+
+                for (int c = 0; c < group.Contours.Count; c++)
+                {
+                    SwfFillContour contour = group.Contours[c];
+
+                    if (contour == null || contour.Points == null || contour.Points.Count < 2)
+                        continue;
+
+                    GameObject go = new GameObject(name + "_Group_" + g + "_Contour_" + c);
+                    go.transform.SetParent(root, false);
+
+                    LineRenderer line = go.AddComponent<LineRenderer>();
+                    line.material = lineMaterial;
+                    line.positionCount = contour.Points.Count;
+                    line.loop = true;
+                    line.useWorldSpace = false;
+                    line.widthMultiplier = 0.06f;
+
+                    line.sortingLayerName = "Default";
+                    line.sortingOrder = 20000;
+
+                    Color contourColor = contour.IsHoleCandidate ? Color.red : Color.yellow;
+                    
+                    line.startColor = contourColor;
+                    line.endColor = contourColor;
+
+                    for (int i = 0; i < contour.Points.Count; i++)
+                    {
+                        Vector2 point = contour.Points[i];
+                        line.SetPosition(i, FlashToUnityPoint(point.x, point.y, matrix));
+                    }
+
+                    Debug.Log(
+                        "Contour Debug Shape=" + shape.CharacterId +
+                        " Group=" + g +
+                        " Contour=" + c +
+                        " Points=" + contour.Points.Count +
+                        " Area=" + contour.Area +
+                        " Closed=" + contour.IsClosed
+                    );
+                }
+            }
+        }
+
         public void DrawShapeOutline(DefineShapeTag shape, SwfMatrix matrix, string name)
         {
             if (shape == null || shape.ShapeData == null || shape.ShapeData.Paths == null)

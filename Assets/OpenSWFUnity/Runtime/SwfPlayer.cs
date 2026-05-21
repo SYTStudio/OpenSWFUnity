@@ -13,8 +13,8 @@ namespace OpenSWFUnity.Runtime
         [Header("Render Options")]
         public bool applyBackgroundColor = true;
 
-        [Tooltip("Draws debug rectangle bounds around parsed SWF shapes.")]
-        public bool enableDebugLines = true;
+        [Tooltip("Draws SWF fills using a software rasterizer with even-odd fill rule.")]
+        public bool enableRasterFills = false;
 
         [Tooltip("Draws parsed SWF ShapeRecords as outline lines.")]
         public bool enableShapeOutlines = true;
@@ -22,8 +22,25 @@ namespace OpenSWFUnity.Runtime
         [Tooltip("Draws experimental filled meshes. This is not a full SWF fill renderer yet.")]
         public bool enableShapeFills = false;
 
+        [Tooltip("Uses stencil masking to cut detected hole contours from filled SWF shapes.")]
+        public bool enableStencilHoles = false;
+
         [Header("Debug")]
+
+        [Tooltip("Enable detailed Log parsing information to the console. This can be very verbose for complex SWFs.")]
         public bool verboseLogging = false;
+
+        [Tooltip("Draws debug rectangle bounds around parsed SWF shapes.")]
+        public bool enableDebugLines = true;
+
+        [Tooltip("If greater than 0, only this SWF character ID will be rendered.")]
+        public int debugOnlyCharacterId = 0;
+
+        [Tooltip("Draws fill contour outlines for debugging holes and contour order.")]
+        public bool enableFillContourDebug = false;
+
+        [Tooltip("Draws detected hole contours using the background color for visual testing only.")]
+        public bool enableHolePreview = false;
 
         private void Start()
         {
@@ -101,11 +118,27 @@ namespace OpenSWFUnity.Runtime
                     {
                         Debug.Log("First Shape Path " + i + ": " + parser.Shapes[0].ShapeData.Paths[i]);
                     }
+
+                    for (int i = 0; i < parser.Shapes.Count; i++)
+                    {
+                        var shape = parser.Shapes[i];
+
+                        if (shape.ShapeData == null)
+                            continue;
+
+                        Debug.Log(
+                            "Shape " + shape.CharacterId +
+                            " Paths=" + shape.ShapeData.Paths.Count +
+                            " Edges=" + shape.ShapeData.Edges.Count +
+                            " Groups=" + shape.ShapeData.FillEdgeGroups.Count +
+                            " Contours=" + CountContours(shape.ShapeData)
+                        );
+                    }
                 }
 
                 ClearDebugLines();
 
-                if (enableDebugLines || enableShapeOutlines || enableShapeFills)
+                if (enableDebugLines || enableShapeOutlines || enableShapeFills || enableRasterFills || enableFillContourDebug)
                 {
                     RenderTopLevelDebug(parser);
                 }
@@ -116,19 +149,37 @@ namespace OpenSWFUnity.Runtime
             }
         }
 
+        private int CountContours(SwfShapeData data)
+        {
+            int count = 0;
+
+            if (data == null || data.FillEdgeGroups == null)
+                return 0;
+
+            for (int i = 0; i < data.FillEdgeGroups.Count; i++)
+            {
+                if (data.FillEdgeGroups[i].Contours != null)
+                    count += data.FillEdgeGroups[i].Contours.Count;
+            }
+
+            return count;
+        }
+
         private void ClearDebugLines()
         {
             for (int i = transform.childCount - 1; i >= 0; i--)
             {
                 Transform child = transform.GetChild(i);
 
-                if (
-                child.name.StartsWith("Shape_") ||
-                child.name.StartsWith("Debug_") ||
-                child.name.StartsWith("Outline_") ||
-                child.name.StartsWith("Fill_")
-                )
-                {
+                if(
+    child.name.StartsWith("Shape_") ||
+    child.name.StartsWith("Debug_") ||
+    child.name.StartsWith("Outline_") ||
+    child.name.StartsWith("Fill_") ||
+    child.name.StartsWith("RasterFill_") ||
+    child.name.StartsWith("FillContour_")
+)
+{
                     Destroy(child.gameObject);
                 }
             }
@@ -157,17 +208,33 @@ namespace OpenSWFUnity.Runtime
         }
 
         private void RenderCharacterDebug(
-    SwfParser parser,
-    SwfDebugRenderer renderer,
-    ushort characterId,
-    SwfMatrix worldMatrix,
-    string path
-)
+            SwfParser parser,
+            SwfDebugRenderer renderer,
+            ushort characterId,
+            SwfMatrix worldMatrix,
+            string path
+        )
         {
             DefineShapeTag shape = parser.FindShapeById(characterId);
 
             if (shape != null)
             {
+                if (debugOnlyCharacterId > 0 && characterId != debugOnlyCharacterId)
+                {
+                    return;
+                }
+
+                if (enableRasterFills)
+                {
+                    SwfRasterFillRenderer rasterRenderer = new SwfRasterFillRenderer(transform);
+
+                    rasterRenderer.DrawShapeRasterFill(
+                        shape,
+                        worldMatrix,
+                        "RasterFill_" + characterId + "_" + path
+                    );
+                }
+
                 if (enableShapeFills)
                 {
                     SwfMeshRenderer meshRenderer = new SwfMeshRenderer(transform);
@@ -175,7 +242,17 @@ namespace OpenSWFUnity.Runtime
                     meshRenderer.DrawShapeFill(
                         shape,
                         worldMatrix,
-                        "Fill_" + characterId + "_" + path
+                        "Fill_" + characterId + "_" + path,
+                        enableStencilHoles
+                    );
+                }
+
+                if (enableFillContourDebug)
+                {
+                    renderer.DrawFillContours(
+                        shape,
+                        worldMatrix,
+                        "FillContour_" + characterId + "_" + path
                     );
                 }
 

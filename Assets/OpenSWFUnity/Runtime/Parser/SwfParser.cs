@@ -706,6 +706,26 @@ namespace OpenSWFUnity.Runtime.Parser
                         currentLineStyle = (int)reader.ReadUBits(numLineBits);
                     }
 
+                    bool styleChanged =
+                        stateFillStyle0 ||
+                        stateFillStyle1 ||
+                        stateLineStyle;
+
+                    if (styleChanged && !stateMoveTo)
+                    {
+                        // Start a new path at the current position when the fill/line style changes.
+                        // SWF can change styles without moving to a new position.
+                        currentPath = new SwfShapePath
+                        {
+                            FillStyle0 = currentFillStyle0,
+                            FillStyle1 = currentFillStyle1,
+                            LineStyle = currentLineStyle
+                        };
+
+                        currentPath.Points.Add(new Vector2(currentX / 20f, currentY / 20f));
+                        shapeData.Paths.Add(currentPath);
+                    }
+
                     if (stateNewStyles)
                     {
                         // New styles inside shape records are not supported yet.
@@ -1028,27 +1048,6 @@ namespace OpenSWFUnity.Runtime.Parser
 
                     shapeData.Edges.Add(edge);
                 }
-
-                // Add closing edge if the path has a fill.
-                if (path.HasFill && path.Points.Count >= 3)
-                {
-                    Vector2 first = path.Points[0];
-                    Vector2 last = path.Points[path.Points.Count - 1];
-
-                    if (Vector2.Distance(first, last) > 0.01f)
-                    {
-                        SwfShapeEdge closingEdge = new SwfShapeEdge
-                        {
-                            Start = last,
-                            End = first,
-                            FillStyle0 = path.FillStyle0,
-                            FillStyle1 = path.FillStyle1,
-                            LineStyle = path.LineStyle
-                        };
-
-                        shapeData.Edges.Add(closingEdge);
-                    }
-                }
             }
         }
 
@@ -1119,7 +1118,75 @@ namespace OpenSWFUnity.Runtime.Parser
 
                     group.Contours.Add(contour);
                 }
+
+                MarkHoleCandidates(group);
             }
+        }
+
+        private void MarkHoleCandidates(SwfFillEdgeGroup group)
+        {
+            if (group == null || group.Contours == null)
+                return;
+
+            for (int i = 0; i < group.Contours.Count; i++)
+            {
+                SwfFillContour contour = group.Contours[i];
+                contour.IsHoleCandidate = false;
+
+                if (contour.Points == null || contour.Points.Count < 3)
+                    continue;
+
+                Vector2 center = GetContourCenter(contour);
+
+                for (int j = 0; j < group.Contours.Count; j++)
+                {
+                    SwfFillContour other = group.Contours[j];
+
+                    if (other == contour || other == null || other.Points == null || other.Points.Count < 3)
+                        continue;
+
+                    bool smaller = Mathf.Abs(contour.Area) < Mathf.Abs(other.Area);
+                    bool inside = PointInPolygon(center, other.Points);
+
+                    if (smaller && inside)
+                    {
+                        contour.IsHoleCandidate = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        private Vector2 GetContourCenter(SwfFillContour contour)
+        {
+            Vector2 sum = Vector2.zero;
+
+            for (int i = 0; i < contour.Points.Count; i++)
+            {
+                sum += contour.Points[i];
+            }
+
+            return sum / contour.Points.Count;
+        }
+
+        private bool PointInPolygon(Vector2 point, List<Vector2> polygon)
+        {
+            bool inside = false;
+
+            for (int i = 0, j = polygon.Count - 1; i < polygon.Count; j = i++)
+            {
+                Vector2 pi = polygon[i];
+                Vector2 pj = polygon[j];
+
+                bool intersect =
+                    ((pi.y > point.y) != (pj.y > point.y)) &&
+                    (point.x < (pj.x - pi.x) * (point.y - pi.y) / ((pj.y - pi.y) + 0.00001f) + pi.x);
+
+                if (intersect)
+                    inside = !inside;
+            }
+
+            return inside;
         }
 
         private bool PointsClose(Vector2 a, Vector2 b)
