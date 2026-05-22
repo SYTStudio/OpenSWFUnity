@@ -16,6 +16,7 @@ namespace OpenSWFUnity.Runtime.Tags
         public ushort Depth;
         public ushort CharacterId;
         public SwfMatrix Matrix;
+        public SwfColorTransform ColorTransform = SwfColorTransform.Identity;
 
         public override string ToString()
         {

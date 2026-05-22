@@ -149,11 +149,14 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::OpenSWFUnity.Runtime.SwfPlayer
   swfFile: {fileID: 4900000, guid: 3f5a3fed73136884f86616e5b147e261, type: 3}
+  renderQuality: 2
   applyBackgroundColor: 1
-  enableDebugLines: 0
   enableShapeOutlines: 0
-  enableShapeFills: 1
   verboseLogging: 0
+  enableDebugLines: 0
+  debugOnlyCharacterId: 0
+  enableFillContourDebug: 0
+  enableHolePreview: 0
 --- !u!4 &477384985
 Transform:
   m_ObjectHideFlags: 0

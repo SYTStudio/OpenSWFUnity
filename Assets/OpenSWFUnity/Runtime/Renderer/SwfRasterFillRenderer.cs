@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using OpenSWFUnity.Runtime.Parser;
 using OpenSWFUnity.Runtime.Tags;
+using Unity.Mathematics;
 
 namespace OpenSWFUnity.Runtime.Renderer
 {
@@ -15,17 +16,29 @@ namespace OpenSWFUnity.Runtime.Renderer
         private const float PixelsPerUnit = 50f;
 
         // Higher value = sharper texture, but slower generation.
-        private const float RasterScale = 4f;
+        public static float RasterScale = 2f;
 
         public SwfRasterFillRenderer(Transform root)
         {
             this.root = root;
+            RasterScale = GetRasterScale();
 
             Shader shader = Shader.Find("Sprites/Default");
             material = new Material(shader);
         }
 
-        public void DrawShapeRasterFill(DefineShapeTag shape, SwfMatrix matrix, string name)
+        private float GetRasterScale()
+        {
+            if (SwfPlayer.Instance != null)
+            {
+                float qualityScale = (float)SwfPlayer.Instance.renderQuality;
+                return qualityScale;
+            }
+
+            return 4f;
+        }
+
+        public void DrawShapeRasterFill(DefineShapeTag shape, SwfMatrix matrix, string name, float alpha)
         {
             if (shape == null || shape.ShapeData == null || shape.ShapeData.FillEdgeGroups == null)
                 return;
@@ -38,6 +51,7 @@ namespace OpenSWFUnity.Runtime.Renderer
                     continue;
 
                 Color fillColor = GetFillColor(shape, group.FillStyleIndex);
+                fillColor.a *= alpha;
 
                 if (fillColor.a <= 0f)
                     continue;

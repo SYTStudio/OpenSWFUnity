@@ -6,11 +6,19 @@ namespace OpenSWFUnity.Runtime.Tags
     {
         public ushort SpriteId;
         public ushort FrameCount;
+
         public List<SwfTag> ControlTags = new List<SwfTag>();
+
+        // New timeline frames.
+        public List<SwfFrame> Frames = new List<SwfFrame>();
 
         public override string ToString()
         {
-            return $"DefineSprite SpriteId={SpriteId} FrameCount={FrameCount} InnerTags={ControlTags.Count}";
+            return
+                "DefineSprite SpriteId=" + SpriteId +
+                " FrameCount=" + FrameCount +
+                " ControlTags=" + ControlTags.Count +
+                " Frames=" + Frames.Count;
         }
     }
 }

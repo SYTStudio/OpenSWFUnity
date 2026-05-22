@@ -2,28 +2,59 @@ using UnityEngine;
 using OpenSWFUnity.Runtime.Parser;
 using OpenSWFUnity.Runtime.Renderer;
 using OpenSWFUnity.Runtime.Tags;
+using Unity.VisualScripting;
+using UnityEngine.Assertions.Must;
+using System.Collections.Generic;
 
 namespace OpenSWFUnity.Runtime
 {
     public class SwfPlayer : MonoBehaviour
     {
+
+        public static SwfPlayer Instance { get; private set; }
+
+        private void Awake()
+        {
+            Instance = this;
+        }
+
         [Header("SWF File")]
         public TextAsset swfFile;
+        public enum RenderQuality
+        {
+            Low = 1,
+            Medium = 2,
+            High = 4,
+            Ultra = 8
+        }
 
         [Header("Render Options")]
+
+        [Tooltip("Quality level for software raster fills. Higher quality may be slower to render. This is not a full SWF fill renderer yet.")]
+        public RenderQuality renderQuality = RenderQuality.High;
+
+        [Tooltip("Applies the SWF background color to the main camera if available.")]
         public bool applyBackgroundColor = true;
 
         [Tooltip("Draws SWF fills using a software rasterizer with even-odd fill rule.")]
-        public bool enableRasterFills = false;
+        private bool enableRasterFills = true;
 
         [Tooltip("Draws parsed SWF ShapeRecords as outline lines.")]
         public bool enableShapeOutlines = true;
 
-        [Tooltip("Draws experimental filled meshes. This is not a full SWF fill renderer yet.")]
-        public bool enableShapeFills = false;
+        [Header("Timeline")]
 
-        [Tooltip("Uses stencil masking to cut detected hole contours from filled SWF shapes.")]
-        public bool enableStencilHoles = false;
+        [Tooltip("Plays parsed SWF timeline frames.")]
+        public bool enableTimelinePlayback = true;
+
+        [Tooltip("Current root frame used for timeline debug.")]
+        public int debugFrame = 0;
+
+        [Tooltip("Automatically advances debug frames in Play Mode.")]
+        public bool autoPlayTimeline = true;
+
+        private float timelineTimer;
+        private int currentFrame;
 
         [Header("Debug")]
 
@@ -42,6 +73,46 @@ namespace OpenSWFUnity.Runtime
         [Tooltip("Draws detected hole contours using the background color for visual testing only.")]
         public bool enableHolePreview = false;
 
+        [Tooltip("Draws parsed SWF text using Unity TextMesh for debugging.")]
+        public bool enableTextMeshDebug = true;
+
+        [Tooltip("TextMesh character size multiplier for debug text rendering.")]
+        public float textMeshCharacterSize = 0.055f;
+
+        [Tooltip("Divides TextHeight to correct Unity TextMesh baseline.")]
+        public float textMeshBaselineDivisor = 22f;
+
+        private float swfFrameRate = 30f;
+
+        [Header("Timeline Debug")]
+        [Tooltip("Uses parsed sprite frames instead of rendering all sprite control tags.")]
+        public bool enableSpriteTimelineDebug = true;
+
+        [Tooltip("Frame index used for sprite timeline debug rendering.")]
+        public int debugTimelineFrame = 0;
+
+
+        private void Update()
+        {
+            if (!Application.isPlaying)
+                return;
+
+            if (!enableTimelinePlayback || !autoPlayTimeline)
+                return;
+
+            timelineTimer += Time.deltaTime;
+
+            float frameDuration = 1f / Mathf.Max(1f, swfFrameRate);
+
+            if (timelineTimer >= frameDuration)
+            {
+                timelineTimer -= frameDuration;
+                currentFrame++;
+
+                // RenderCurrentFrame();
+            }
+        }
+
         private void Start()
         {
             if (swfFile == null)
@@ -59,6 +130,18 @@ namespace OpenSWFUnity.Runtime
                 Debug.Log(header.ToString());
 
                 parser.ParseTags();
+
+                Debug.Log(
+                    "Text/Font Summary\n" +
+                    "DefineFont=" + parser.DefineFontCount + "\n" +
+                    "DefineFont2=" + parser.DefineFont2Count + "\n" +
+                    "DefineFont3=" + parser.DefineFont3Count + "\n" +
+                    "DefineText=" + parser.DefineTextCount + "\n" +
+                    "DefineText2=" + parser.DefineText2Count + "\n" +
+                    "DefineEditText=" + parser.DefineEditTextCount + "\n" +
+                    "CSMTextSettings=" + parser.CsmTextSettingsCount + "\n" +
+                    "FontAlignZones=" + parser.FontAlignZonesCount
+                );
 
                 if (applyBackgroundColor && parser.BackgroundColor != null && Camera.main != null)
                 {
@@ -138,7 +221,7 @@ namespace OpenSWFUnity.Runtime
 
                 ClearDebugLines();
 
-                if (enableDebugLines || enableShapeOutlines || enableShapeFills || enableRasterFills || enableFillContourDebug)
+                if (enableDebugLines || enableShapeOutlines || enableRasterFills || enableFillContourDebug || enableTextMeshDebug)
                 {
                     RenderTopLevelDebug(parser);
                 }
@@ -171,15 +254,16 @@ namespace OpenSWFUnity.Runtime
             {
                 Transform child = transform.GetChild(i);
 
-                if(
+                if (
     child.name.StartsWith("Shape_") ||
     child.name.StartsWith("Debug_") ||
     child.name.StartsWith("Outline_") ||
     child.name.StartsWith("Fill_") ||
     child.name.StartsWith("RasterFill_") ||
-    child.name.StartsWith("FillContour_")
+    child.name.StartsWith("FillContour_") ||
+    child.name.StartsWith("Text_")
 )
-{
+                {
                     Destroy(child.gameObject);
                 }
             }
@@ -212,7 +296,8 @@ namespace OpenSWFUnity.Runtime
             SwfDebugRenderer renderer,
             ushort characterId,
             SwfMatrix worldMatrix,
-            string path
+            string path,
+            float alpha = 1f
         )
         {
             DefineShapeTag shape = parser.FindShapeById(characterId);
@@ -231,19 +316,8 @@ namespace OpenSWFUnity.Runtime
                     rasterRenderer.DrawShapeRasterFill(
                         shape,
                         worldMatrix,
-                        "RasterFill_" + characterId + "_" + path
-                    );
-                }
-
-                if (enableShapeFills)
-                {
-                    SwfMeshRenderer meshRenderer = new SwfMeshRenderer(transform);
-
-                    meshRenderer.DrawShapeFill(
-                        shape,
-                        worldMatrix,
-                        "Fill_" + characterId + "_" + path,
-                        enableStencilHoles
+                        "RasterFill_" + characterId + "_" + path,
+                        alpha
                     );
                 }
 
@@ -297,6 +371,35 @@ namespace OpenSWFUnity.Runtime
                 return;
             }
 
+            DefineTextTag text = parser.FindTextById(characterId);
+
+            if (text != null)
+            {
+                if (enableTextMeshDebug)
+                {
+                    SwfTextRenderer textRenderer = new SwfTextRenderer(transform);
+
+                    for (int i = 0; i < text.Records.Count; i++)
+                    {
+                        SwfTextRecord record = text.Records[i];
+                        string decoded = parser.DecodeTextRecordPublic(record);
+
+                        textRenderer.DrawText(
+                            text,
+                            record,
+                            decoded,
+                            worldMatrix,
+                            "Text_" + characterId + "_" + path + "_Record_" + i,
+                            textMeshCharacterSize,
+                            textMeshBaselineDivisor,
+                            alpha
+                        );
+                    }
+                }
+
+                return;
+            }
+
             if (verboseLogging)
             {
                 Debug.LogWarning("Unknown CharacterId: " + characterId + " at " + path);
@@ -311,38 +414,149 @@ namespace OpenSWFUnity.Runtime
             string path
         )
         {
-            foreach (SwfTag innerTag in sprite.ControlTags)
+
+
+            List<PlaceObject2Tag> places = new List<PlaceObject2Tag>();
+
+            if (enableSpriteTimelineDebug && sprite.Frames != null && sprite.Frames.Count > 0)
             {
-                if (innerTag.Code == 26) // PlaceObject2
+                int localFrame = debugTimelineFrame % sprite.Frames.Count;
+
+                places = BuildSpriteDisplayListForFrame(
+                    parser,
+                    sprite,
+                    localFrame
+                );
+            }
+            else
+            {
+                foreach (SwfTag innerTag in sprite.ControlTags)
                 {
+                    if (innerTag.Code != 26)
+                        continue;
+
                     try
                     {
                         PlaceObject2Tag innerPlace = parser.ParsePlaceObject2FromTag(innerTag);
 
-                        if (!innerPlace.HasCharacter || innerPlace.CharacterId == 0)
-                        {
-                            continue;
-                        }
-
-                        SwfMatrix combinedMatrix = SwfMatrix.Combine(
-                            parentMatrix,
-                            innerPlace.Matrix
-                        );
-
-                        RenderCharacterDebug(
-                            parser,
-                            renderer,
-                            innerPlace.CharacterId,
-                            combinedMatrix,
-                            path + "_Depth_" + innerPlace.Depth
-                        );
+                        if (innerPlace != null)
+                            places.Add(innerPlace);
                     }
                     catch (System.Exception e)
                     {
-                        Debug.LogWarning("Failed inner PlaceObject2 parse in sprite " + sprite.SpriteId + ": " + e.Message);
+                        Debug.LogWarning(
+                            "Failed inner PlaceObject2 parse in sprite " +
+                            sprite.SpriteId + ": " + e.Message
+                        );
                     }
                 }
             }
+
+            for (int i = 0; i < places.Count; i++)
+            {
+                PlaceObject2Tag innerPlace = places[i];
+
+                if (innerPlace == null)
+                    continue;
+
+                if (!innerPlace.HasCharacter || innerPlace.CharacterId == 0)
+                    continue;
+
+                float alpha = 1f;
+
+                if (innerPlace.HasColorTransform && innerPlace.ColorTransform != null)
+                {
+                    alpha = innerPlace.ColorTransform.AlphaMultiplier01;
+                }
+
+                SwfMatrix combinedMatrix = SwfMatrix.Combine(
+                    parentMatrix,
+                    innerPlace.Matrix
+                );
+
+                RenderCharacterDebug(
+                    parser,
+                    renderer,
+                    innerPlace.CharacterId,
+                    combinedMatrix,
+                    path + "_Frame_" + debugTimelineFrame + "_Depth_" + innerPlace.Depth,
+                    alpha
+                );
+            }
+        }
+
+        private List<PlaceObject2Tag> BuildSpriteDisplayListForFrame(
+            SwfParser parser,
+            DefineSpriteTag sprite,
+            int frameIndex
+        )
+        {
+            Dictionary<ushort, PlaceObject2Tag> activeByDepth =
+                new Dictionary<ushort, PlaceObject2Tag>();
+
+            if (sprite == null || sprite.Frames == null || sprite.Frames.Count == 0)
+                return new List<PlaceObject2Tag>();
+
+            int maxFrame = Mathf.Clamp(frameIndex, 0, sprite.Frames.Count - 1);
+
+            for (int f = 0; f <= maxFrame; f++)
+            {
+                SwfFrame frame = sprite.Frames[f];
+
+                if (frame == null || frame.ControlTags == null)
+                    continue;
+
+                for (int t = 0; t < frame.ControlTags.Count; t++)
+                {
+                    SwfTag tag = frame.ControlTags[t];
+
+                    if (tag == null)
+                        continue;
+
+                    if (tag.Code == 26) // PlaceObject2
+                    {
+                        PlaceObject2Tag place = parser.ParsePlaceObject2FromTag(tag);
+
+                        if (place == null)
+                            continue;
+
+                        if (activeByDepth.TryGetValue(place.Depth, out PlaceObject2Tag existing))
+                        {
+                            if (!place.HasCharacter || place.CharacterId == 0)
+                            {
+                                place.CharacterId = existing.CharacterId;
+                                place.HasCharacter = existing.HasCharacter;
+                            }
+
+                            if (!place.HasColorTransform)
+                            {
+                                place.ColorTransform = existing.ColorTransform;
+                                place.HasColorTransform = existing.HasColorTransform;
+                            }
+
+                            if (!place.HasMatrix)
+                            {
+                                place.Matrix = existing.Matrix;
+                                place.HasMatrix = existing.HasMatrix;
+                            }
+                        }
+
+                        activeByDepth[place.Depth] = place;
+                    }
+                    else if (tag.Code == 28) // RemoveObject2
+                    {
+                        ushort depth = parser.ParseRemoveObject2DepthFromTag(tag);
+
+                        if (activeByDepth.ContainsKey(depth))
+                            activeByDepth.Remove(depth);
+                    }
+                }
+            }
+
+            List<PlaceObject2Tag> result = new List<PlaceObject2Tag>(activeByDepth.Values);
+            result.Sort((a, b) => a.Depth.CompareTo(b.Depth));
+
+            return result;
         }
     }
 }

@@ -20,8 +20,20 @@ namespace OpenSWFUnity.Runtime.Parser
         public System.Collections.Generic.List<DefineShapeTag> Shapes { get; private set; } = new System.Collections.Generic.List<DefineShapeTag>();
         public System.Collections.Generic.List<PlaceObject2Tag> PlacedObjects { get; private set; } = new System.Collections.Generic.List<PlaceObject2Tag>();
         public System.Collections.Generic.List<DefineSpriteTag> Sprites { get; private set; } = new System.Collections.Generic.List<DefineSpriteTag>();
+        public System.Collections.Generic.List<DefineTextTag> Texts { get; private set; } = new System.Collections.Generic.List<DefineTextTag>();
+        public System.Collections.Generic.List<DefineFont3Tag> Fonts3 { get; private set; } = new System.Collections.Generic.List<DefineFont3Tag>();
 
         public SetBackgroundColorTag BackgroundColor { get; private set; }
+
+
+        public int DefineFontCount;
+        public int DefineFont2Count;
+        public int DefineFont3Count;
+        public int DefineTextCount;
+        public int DefineText2Count;
+        public int DefineEditTextCount;
+        public int CsmTextSettingsCount;
+        public int FontAlignZonesCount;
 
         public SwfParser(byte[] swfBytes)
         {
@@ -253,6 +265,64 @@ namespace OpenSWFUnity.Runtime.Parser
             {
                 ParseDefineSprite(tag);
             }
+
+            if (tag.Code == 11)
+            {
+                ParseDefineText(tag);
+            }
+
+            if (tag.Code == 75)
+            {
+                ParseDefineFont3(tag);
+            }
+
+            // Text / Font detection
+            switch (tag.Code)
+            {
+                case 10:
+                    DefineFontCount++;
+                    break;
+
+                case 11:
+                    DefineTextCount++;
+                    break;
+
+                case 33:
+                    DefineText2Count++;
+                    break;
+
+                case 37:
+                    DefineEditTextCount++;
+                    break;
+
+                case 48:
+                    DefineFont2Count++;
+                    break;
+
+                case 73:
+                    FontAlignZonesCount++;
+                    break;
+
+                case 74:
+                    CsmTextSettingsCount++;
+                    break;
+
+                case 75:
+                    DefineFont3Count++;
+                    break;
+            }
+
+            {
+                if (VerboseLogging)
+                {
+                    Debug.Log(
+                        "Tag: " + SwfTagNames.GetName(tag.Code) +
+                        " Code=" + tag.Code +
+                        " Length=" + tag.Length +
+                        " DataStart=" + tag.DataStart
+                    );
+                }
+            }
         }
 
         private ushort ReadUInt16LEAt(int offset)
@@ -284,6 +354,11 @@ namespace OpenSWFUnity.Runtime.Parser
             };
         }
 
+        public ushort ParseRemoveObject2DepthFromTag(SwfTag tag)
+        {
+            return ReadUInt16LEAt(tag.DataStart);
+        }
+
         private void ParseDefineSprite(SwfTag tag)
         {
             try
@@ -300,6 +375,11 @@ namespace OpenSWFUnity.Runtime.Parser
                 {
                     SpriteId = spriteId,
                     FrameCount = frameCount
+                };
+
+                SwfFrame currentFrame = new SwfFrame
+                {
+                    FrameIndex = 0
                 };
 
                 int spriteEnd = tag.DataStart + tag.Length;
@@ -326,6 +406,7 @@ namespace OpenSWFUnity.Runtime.Parser
                         Name = SwfTagNames.GetName(innerCode)
                     };
 
+                    // Keep old flat list for compatibility.
                     sprite.ControlTags.Add(innerTag);
 
                     if (VerboseLogging)
@@ -335,16 +416,54 @@ namespace OpenSWFUnity.Runtime.Parser
                         );
                     }
 
-                    p += innerLength;
-
+                    // End tag closes sprite parsing.
                     if (innerCode == 0) // End
+                    {
+                        if (currentFrame.ControlTags.Count > 0)
+                        {
+                            sprite.Frames.Add(currentFrame);
+                        }
+
+                        p += innerLength;
                         break;
+                    }
+
+                    // ShowFrame closes current frame.
+                    if (innerCode == 1) // ShowFrame
+                    {
+                        sprite.Frames.Add(currentFrame);
+
+                        currentFrame = new SwfFrame
+                        {
+                            FrameIndex = sprite.Frames.Count
+                        };
+
+                        p += innerLength;
+                        continue;
+                    }
+
+                    // Add normal control tags to current frame.
+                    currentFrame.ControlTags.Add(innerTag);
+
+                    p += innerLength;
                 }
 
                 Sprites.Add(sprite);
 
+                Debug.Log(
+                    "Parsed Sprite Timeline. SpriteId=" + sprite.SpriteId +
+                    " DeclaredFrames=" + sprite.FrameCount +
+                    " ParsedFrames=" + sprite.Frames.Count +
+                    " ControlTags=" + sprite.ControlTags.Count
+                );
+
                 if (VerboseLogging)
-                    Debug.Log(tag.ToString());
+                {
+                    for (int i = 0; i < sprite.Frames.Count; i++)
+                    {
+                        Debug.Log("  " + sprite.Frames[i].ToString());
+                    }
+                }
             }
             catch (System.Exception e)
             {
@@ -512,7 +631,49 @@ namespace OpenSWFUnity.Runtime.Parser
                 place.Matrix = SwfMatrix.Identity;
             }
 
+            if (place.HasColorTransform)
+            {
+                place.ColorTransform = ReadColorTransformWithAlpha(p, out int afterCxForm);
+                p = afterCxForm;
+            }
+
             return place;
+        }
+
+        private SwfColorTransform ReadColorTransformWithAlpha(int offset, out int afterOffset)
+        {
+            SwfBitReader reader = new SwfBitReader(data, offset);
+
+            SwfColorTransform cx = new SwfColorTransform();
+
+            bool hasAddTerms = reader.ReadUBits(1) == 1;
+            bool hasMultTerms = reader.ReadUBits(1) == 1;
+
+            int nbits = (int)reader.ReadUBits(4);
+
+            cx.HasAddTerms = hasAddTerms;
+            cx.HasMultTerms = hasMultTerms;
+
+            if (hasMultTerms)
+            {
+                cx.RedMult = reader.ReadSBits(nbits);
+                cx.GreenMult = reader.ReadSBits(nbits);
+                cx.BlueMult = reader.ReadSBits(nbits);
+                cx.AlphaMult = reader.ReadSBits(nbits);
+            }
+
+            if (hasAddTerms)
+            {
+                cx.RedAdd = reader.ReadSBits(nbits);
+                cx.GreenAdd = reader.ReadSBits(nbits);
+                cx.BlueAdd = reader.ReadSBits(nbits);
+                cx.AlphaAdd = reader.ReadSBits(nbits);
+            }
+
+            reader.AlignToByte();
+            afterOffset = reader.BytePosition;
+
+            return cx;
         }
 
         private SwfShapeData ParseShapeStylesOnly(ushort characterId, int offset, out int afterStylesPosition)
@@ -1189,9 +1350,334 @@ namespace OpenSWFUnity.Runtime.Parser
             return inside;
         }
 
+        private void ParseDefineText(SwfTag tag)
+        {
+            try
+            {
+                int p = tag.DataStart;
+
+                ushort characterId = ReadUInt16LEAt(p);
+                p += 2;
+
+                SwfRect bounds = ReadRectAt(p, out int afterBounds);
+                p = afterBounds;
+
+                SwfMatrix textMatrix = ReadMatrixAt(p, out int afterMatrix);
+                p = afterMatrix;
+
+                byte glyphBits = data[p++];
+                byte advanceBits = data[p++];
+
+                DefineTextTag text = new DefineTextTag
+                {
+                    CharacterId = characterId,
+                    TextBounds = bounds,
+                    TextMatrix = textMatrix,
+                    GlyphBits = glyphBits,
+                    AdvanceBits = advanceBits
+                };
+
+                ParseTextRecords(text, p, tag.DataStart + tag.Length);
+
+                Texts.Add(text);
+
+                Debug.Log(text.ToString());
+
+                for (int i = 0; i < text.Records.Count; i++)
+                {
+                    SwfTextRecord record = text.Records[i];
+
+                    Debug.Log("  " + record.ToString());
+
+                    string decoded = DecodeTextRecord(record);
+                    Debug.Log("  Decoded Text: \"" + decoded + "\"");
+
+                    int max = System.Math.Min(10, record.GlyphEntries.Count);
+                    for (int g = 0; g < max; g++)
+                    {
+                        SwfGlyphEntry entry = record.GlyphEntries[g];
+
+                        char ch = '?';
+
+                        DefineFont3Tag font = FindFont3ById(record.FontId);
+
+                        if (font != null && entry.GlyphIndex >= 0 && entry.GlyphIndex < font.CodeTable.Count)
+                        {
+                            ch = (char)font.CodeTable[entry.GlyphIndex];
+                        }
+
+                        Debug.Log(
+                            "    Glyph Index=" + entry.GlyphIndex +
+                            " Char='" + ch +
+                            "' Advance=" + entry.GlyphAdvance
+                        );
+                    }
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning("Failed to parse DefineText at " + tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        private void ParseTextRecords(DefineTextTag text, int offset, int end)
+        {
+            int p = offset;
+
+            while (p < end)
+            {
+                byte recordHeader = data[p++];
+
+                if (recordHeader == 0)
+                    break;
+
+                bool isTextRecord = (recordHeader & 0x80) != 0;
+
+                if (!isTextRecord)
+                {
+                    Debug.LogWarning("Unknown text record header: " + recordHeader);
+                    break;
+                }
+
+                SwfTextRecord record = new SwfTextRecord
+                {
+                    HasFont = (recordHeader & 0x08) != 0,
+                    HasColor = (recordHeader & 0x04) != 0,
+                    HasYOffset = (recordHeader & 0x02) != 0,
+                    HasXOffset = (recordHeader & 0x01) != 0
+                };
+
+                if (record.HasFont)
+                {
+                    record.FontId = ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                if (record.HasColor)
+                {
+                    byte r = data[p++];
+                    byte g = data[p++];
+                    byte b = data[p++];
+
+                    record.Color = new Color(r / 255f, g / 255f, b / 255f, 1f);
+                }
+
+                if (record.HasXOffset)
+                {
+                    record.XOffset = (short)ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                if (record.HasYOffset)
+                {
+                    record.YOffset = (short)ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                if (record.HasFont)
+                {
+                    record.TextHeight = ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                byte glyphCount = data[p++];
+
+                SwfBitReader reader = new SwfBitReader(data, p);
+
+                for (int i = 0; i < glyphCount; i++)
+                {
+                    int glyphIndex = (int)reader.ReadUBits(text.GlyphBits);
+                    int glyphAdvance = reader.ReadSBits(text.AdvanceBits);
+
+                    record.GlyphEntries.Add(new SwfGlyphEntry
+                    {
+                        GlyphIndex = glyphIndex,
+                        GlyphAdvance = glyphAdvance
+                    });
+                }
+
+                reader.AlignToByte();
+                p = reader.BytePosition;
+
+                text.Records.Add(record);
+            }
+        }
+
+        private void ParseDefineFont3(SwfTag tag)
+        {
+            try
+            {
+                int p = tag.DataStart;
+
+                ushort fontId = ReadUInt16LEAt(p);
+                p += 2;
+
+                byte flags = data[p++];
+
+                bool hasLayout = (flags & 0x80) != 0;
+                bool shiftJis = (flags & 0x40) != 0;
+                bool smallText = (flags & 0x20) != 0;
+                bool ansi = (flags & 0x10) != 0;
+                bool wideOffsets = (flags & 0x08) != 0;
+                bool wideCodes = (flags & 0x04) != 0;
+                bool italic = (flags & 0x02) != 0;
+                bool bold = (flags & 0x01) != 0;
+
+                byte languageCode = data[p++];
+
+                byte fontNameLength = data[p++];
+
+                string fontName = System.Text.Encoding.ASCII.GetString(data, p, fontNameLength);
+                p += fontNameLength;
+
+                // Important: DefineFont2/DefineFont3 has NumGlyphs here.
+                ushort numGlyphs = ReadUInt16LEAt(p);
+                p += 2;
+
+                int offsetTableStart = p;
+                int offsetSize = wideOffsets ? 4 : 2;
+
+                // Skip OffsetTable
+                p += numGlyphs * offsetSize;
+
+                // Read CodeTableOffset
+                uint codeTableOffset;
+
+                if (wideOffsets)
+                {
+                    codeTableOffset = ReadUInt32LEAt(p);
+                    p += 4;
+                }
+                else
+                {
+                    codeTableOffset = ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                int glyphShapeTableStart = offsetTableStart;
+
+                int codeTableStart = offsetTableStart + (int)codeTableOffset;
+
+                DefineFont3Tag font = new DefineFont3Tag
+                {
+                    FontId = fontId,
+                    HasLayout = hasLayout,
+                    ShiftJis = shiftJis,
+                    SmallText = smallText,
+                    Ansi = ansi,
+                    WideOffsets = wideOffsets,
+                    WideCodes = wideCodes,
+                    Italic = italic,
+                    Bold = bold,
+                    LanguageCode = languageCode,
+                    FontName = fontName,
+                    GlyphCount = numGlyphs
+                };
+
+                p = codeTableStart;
+
+                for (int i = 0; i < numGlyphs; i++)
+                {
+                    int code;
+
+                    if (wideCodes)
+                    {
+                        code = ReadUInt16LEAt(p);
+                        p += 2;
+                    }
+                    else
+                    {
+                        code = data[p++];
+                    }
+
+                    font.CodeTable.Add(code);
+                }
+
+                Fonts3.Add(font);
+
+                Debug.Log(font.ToString());
+
+                int max = System.Math.Min(30, font.CodeTable.Count);
+
+                for (int i = 0; i < max; i++)
+                {
+                    int code = font.CodeTable[i];
+
+                    Debug.Log(
+                        "  Font glyph " + i +
+                        " -> code " + code +
+                        " char '" + (char)code + "'"
+                    );
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning("Failed to parse DefineFont3 at " + tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        public DefineFont3Tag FindFont3ById(ushort fontId)
+        {
+            for (int i = 0; i < Fonts3.Count; i++)
+            {
+                if (Fonts3[i].FontId == fontId)
+                    return Fonts3[i];
+            }
+
+            return null;
+        }
+
+        private string DecodeTextRecord(SwfTextRecord record)
+        {
+            DefineFont3Tag font = FindFont3ById(record.FontId);
+
+            if (font == null)
+                return "[Missing Font " + record.FontId + "]";
+
+            System.Text.StringBuilder builder = new System.Text.StringBuilder();
+
+            for (int i = 0; i < record.GlyphEntries.Count; i++)
+            {
+                int glyphIndex = record.GlyphEntries[i].GlyphIndex;
+
+                if (glyphIndex >= 0 && glyphIndex < font.CodeTable.Count)
+                {
+                    int code = font.CodeTable[glyphIndex];
+                    builder.Append((char)code);
+                }
+                else
+                {
+                    builder.Append('?');
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private uint ReadUInt32LEAt(int offset)
+        {
+            return System.BitConverter.ToUInt32(data, offset);
+        }
+
         private bool PointsClose(Vector2 a, Vector2 b)
         {
             return Vector2.Distance(a, b) < 0.5f;
+        }
+
+        public DefineTextTag FindTextById(ushort id)
+        {
+            for (int i = 0; i < Texts.Count; i++)
+            {
+                if (Texts[i].CharacterId == id)
+                    return Texts[i];
+            }
+
+            return null;
+        }
+
+        public string DecodeTextRecordPublic(SwfTextRecord record)
+        {
+            return DecodeTextRecord(record);
         }
 
         private struct RectInfo

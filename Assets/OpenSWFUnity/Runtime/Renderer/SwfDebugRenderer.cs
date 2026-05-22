@@ -142,11 +142,11 @@ namespace OpenSWFUnity.Runtime.Renderer
                 line.positionCount = path.Points.Count;
                 line.loop = false;
                 line.useWorldSpace = false;
-                line.widthMultiplier = 0.05f;
+                line.widthMultiplier = 0.01f;
 
                 if (shape.ShapeData.FillStyles.Count > 0)
                 {
-                    Color fillColor = shape.ShapeData.FillStyles[0].ToUnityColor();
+                    Color fillColor = Color.red;
                     line.startColor = fillColor;
                     line.endColor = fillColor;
                 }
