@@ -9,15 +9,21 @@ namespace OpenSWFUnity.Runtime.Parser
         public float TranslateX;
         public float TranslateY;
 
-        public static SwfMatrix Identity => new SwfMatrix
+        public static SwfMatrix Identity
         {
-            ScaleX = 1f,
-            ScaleY = 1f,
-            RotateSkew0 = 0f,
-            RotateSkew1 = 0f,
-            TranslateX = 0f,
-            TranslateY = 0f
-        };
+            get
+            {
+                return new SwfMatrix
+                {
+                    ScaleX = 1f,
+                    ScaleY = 1f,
+                    RotateSkew0 = 0f,
+                    RotateSkew1 = 0f,
+                    TranslateX = 0f,
+                    TranslateY = 0f
+                };
+            }
+        }
 
         public override string ToString()
         {

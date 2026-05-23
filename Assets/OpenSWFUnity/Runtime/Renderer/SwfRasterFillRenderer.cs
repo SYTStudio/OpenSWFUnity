@@ -11,6 +11,8 @@ namespace OpenSWFUnity.Runtime.Renderer
         private readonly Transform root;
         private readonly Material material;
 
+        private static readonly Dictionary<string, Texture2D> rasterTextureCache = new Dictionary<string, Texture2D>();
+
         private const float StageWidth = 600f;
         private const float StageHeight = 400f;
         private const float PixelsPerUnit = 50f;
@@ -61,7 +63,18 @@ namespace OpenSWFUnity.Runtime.Renderer
                 if (bounds.width <= 0.01f || bounds.height <= 0.01f)
                     continue;
 
-                Texture2D texture = BuildRasterTexture(group, bounds, fillColor);
+                string cacheKey =
+                    shape.CharacterId +
+                    "_group_" + g +
+                    "_scale_" + RasterScale +
+                    "_color_" + fillColor.ToString();
+                Texture2D texture;
+
+                if (!rasterTextureCache.TryGetValue(cacheKey, out texture))
+                {
+                    texture = BuildRasterTexture(group, bounds, fillColor);
+                    rasterTextureCache[cacheKey] = texture;
+                }
 
                 if (texture == null)
                     continue;
@@ -114,7 +127,7 @@ namespace OpenSWFUnity.Runtime.Renderer
 
                     Vector2 point = new Vector2(flashX, flashY);
 
-                    if (IsInsideByContourScanline(point, group))
+                    if (IsInsideEvenOddClosedContours(point, group.Contours))
                     {
                         pixels[y * width + x] = fill;
                     }
@@ -125,6 +138,29 @@ namespace OpenSWFUnity.Runtime.Renderer
             texture.Apply(false, false);
 
             return texture;
+        }
+
+        private bool IsInsideEvenOddClosedContours(Vector2 point, List<SwfFillContour> contours)
+        {
+            int crossings = 0;
+
+            for (int i = 0; i < contours.Count; i++)
+            {
+                SwfFillContour contour = contours[i];
+
+                if (contour == null || contour.Points == null || contour.Points.Count < 3)
+                    continue;
+
+                if (!contour.IsClosed)
+                    continue;
+
+                if (PointInPolygon(point, contour.Points))
+                {
+                    crossings++;
+                }
+            }
+
+            return (crossings % 2) == 1;
         }
 
         private Mesh BuildTexturedQuad(Rect bounds, SwfMatrix matrix)

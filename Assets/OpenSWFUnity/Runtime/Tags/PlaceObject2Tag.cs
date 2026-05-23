@@ -12,11 +12,14 @@ namespace OpenSWFUnity.Runtime.Tags
         public bool HasMatrix;
         public bool HasCharacter;
         public bool Move;
+        public bool HasMove;
 
         public ushort Depth;
         public ushort CharacterId;
         public SwfMatrix Matrix;
         public SwfColorTransform ColorTransform = SwfColorTransform.Identity;
+
+        public int TimelineStartFrame;
 
         public override string ToString()
         {

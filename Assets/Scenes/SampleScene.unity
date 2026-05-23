@@ -152,11 +152,20 @@ MonoBehaviour:
   renderQuality: 2
   applyBackgroundColor: 1
   enableShapeOutlines: 0
+  enableTimelinePlayback: 1
+  debugFrame: 0
+  autoPlayTimeline: 1
+  loopSpriteTimelines: 0
   verboseLogging: 0
   enableDebugLines: 0
   debugOnlyCharacterId: 0
   enableFillContourDebug: 0
   enableHolePreview: 0
+  enableTextMeshDebug: 1
+  textMeshCharacterSize: 0.055
+  textMeshBaselineDivisor: 22
+  enableSpriteTimelineDebug: 1
+  debugTimelineFrame: 0
 --- !u!4 &477384985
 Transform:
   m_ObjectHideFlags: 0

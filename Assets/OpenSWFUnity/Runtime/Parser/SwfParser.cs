@@ -609,7 +609,8 @@ namespace OpenSWFUnity.Runtime.Parser
                 HasColorTransform = (flags & 0x08) != 0,
                 HasMatrix = (flags & 0x04) != 0,
                 HasCharacter = (flags & 0x02) != 0,
-                Move = (flags & 0x01) != 0
+                Move = (flags & 0x01) != 0,
+                HasMove = (flags & 0x01) != 0
             };
 
             place.Depth = ReadUInt16LEAt(p);
