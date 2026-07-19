@@ -8,14 +8,16 @@ namespace OpenSWFUnity.Runtime.Renderer
     {
         private readonly Transform root;
         private readonly Material lineMaterial;
+        private readonly float stageWidth;
+        private readonly float stageHeight;
 
-        private const float StageWidth = 600f;
-        private const float StageHeight = 400f;
         private const float PixelsPerUnit = 50f;
 
-        public SwfDebugRenderer(Transform root)
+        public SwfDebugRenderer(Transform root, float stageWidth = 600f, float stageHeight = 400f)
         {
             this.root = root;
+            this.stageWidth = stageWidth;
+            this.stageHeight = stageHeight;
 
             Shader shader = Shader.Find("Sprites/Default");
             lineMaterial = new Material(shader);
@@ -35,8 +37,8 @@ namespace OpenSWFUnity.Runtime.Renderer
 
             float x1 = shape.ShapeBounds.XMinPixels;
             float x2 = shape.ShapeBounds.XMaxPixels;
-            float y1 = -shape.ShapeBounds.YMinPixels;
-            float y2 = -shape.ShapeBounds.YMaxPixels;
+            float y1 = shape.ShapeBounds.YMinPixels;
+            float y2 = shape.ShapeBounds.YMaxPixels;
 
             Vector3 p1 = FlashToUnityPoint(x1, y1, matrix);
             Vector3 p2 = FlashToUnityPoint(x2, y1, matrix);
@@ -52,11 +54,10 @@ namespace OpenSWFUnity.Runtime.Renderer
 
         private Vector3 FlashToUnityPoint(float x, float y, SwfMatrix matrix)
         {
-            float flashX = x * matrix.ScaleX + matrix.TranslateX;
-            float flashY = y * matrix.ScaleY + matrix.TranslateY;
+            Vector2 flashPoint = matrix.TransformPoint(x, y);
 
-            float unityX = flashX - StageWidth / 2f;
-            float unityY = StageHeight / 2f - flashY;
+            float unityX = flashPoint.x - stageWidth / 2f;
+            float unityY = stageHeight / 2f - flashPoint.y;
 
             return new Vector3(
                 unityX / PixelsPerUnit,

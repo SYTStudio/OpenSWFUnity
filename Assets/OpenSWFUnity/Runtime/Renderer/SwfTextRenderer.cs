@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using OpenSWFUnity.Runtime.Parser;
 using OpenSWFUnity.Runtime.Tags;
@@ -6,15 +7,45 @@ namespace OpenSWFUnity.Runtime.Renderer
 {
     public class SwfTextRenderer
     {
-        private readonly Transform root;
+        private readonly Transform poolRoot;
+        private readonly float stageWidth;
+        private readonly float stageHeight;
+        private readonly List<TextInstance> instances = new List<TextInstance>();
+        private int usedInstanceCount;
 
-        private const float StageWidth = 600f;
-        private const float StageHeight = 400f;
         private const float PixelsPerUnit = 50f;
 
-        public SwfTextRenderer(Transform root)
+        public SwfTextRenderer(Transform root, float stageWidth = 600f, float stageHeight = 400f)
         {
-            this.root = root;
+            this.stageWidth = stageWidth;
+            this.stageHeight = stageHeight;
+
+            Transform existingPool = root.Find("__SWF_TextPool");
+
+            if (existingPool != null)
+            {
+                poolRoot = existingPool;
+            }
+            else
+            {
+                GameObject poolObject = new GameObject("__SWF_TextPool");
+                poolObject.transform.SetParent(root, false);
+                poolRoot = poolObject.transform;
+            }
+        }
+
+        public void BeginFrame()
+        {
+            usedInstanceCount = 0;
+        }
+
+        public void EndFrame()
+        {
+            for (int i = usedInstanceCount; i < instances.Count; i++)
+            {
+                if (instances[i].GameObject.activeSelf)
+                    instances[i].GameObject.SetActive(false);
+            }
         }
 
         public void DrawText(
@@ -28,10 +59,9 @@ namespace OpenSWFUnity.Runtime.Renderer
             float alpha
         )
         {
-            GameObject go = new GameObject(name);
-            go.transform.SetParent(root, false);
-
-            TextMesh textMesh = go.AddComponent<TextMesh>();
+            TextInstance instance = AcquireInstance(name);
+            GameObject go = instance.GameObject;
+            TextMesh textMesh = instance.TextMesh;
             textMesh.text = decodedText;
             textMesh.fontSize = 64;
             textMesh.characterSize = characterSize;
@@ -50,7 +80,42 @@ namespace OpenSWFUnity.Runtime.Renderer
                 combinedMatrix
             );
 
+            if (!IsFinite(unityPos))
+            {
+                go.SetActive(false);
+                return;
+            }
+
             go.transform.localPosition = unityPos;
+        }
+
+        private TextInstance AcquireInstance(string instanceName)
+        {
+            TextInstance instance;
+
+            if (usedInstanceCount < instances.Count)
+            {
+                instance = instances[usedInstanceCount];
+            }
+            else
+            {
+                GameObject go = new GameObject(instanceName);
+                go.transform.SetParent(poolRoot, false);
+                instance = new TextInstance
+                {
+                    GameObject = go,
+                    TextMesh = go.AddComponent<TextMesh>()
+                };
+                instances.Add(instance);
+            }
+
+            usedInstanceCount++;
+            instance.GameObject.name = instanceName;
+
+            if (!instance.GameObject.activeSelf)
+                instance.GameObject.SetActive(true);
+
+            return instance;
         }
 
         private Vector2 GetTextPosition(DefineTextTag text, SwfTextRecord record, float baselineDivisor)
@@ -65,11 +130,10 @@ namespace OpenSWFUnity.Runtime.Renderer
 
         private Vector3 FlashToUnityPoint(float x, float y, SwfMatrix matrix)
         {
-            float flashX = x * matrix.ScaleX + matrix.TranslateX;
-            float flashY = y * matrix.ScaleY + matrix.TranslateY;
+            Vector2 flashPoint = matrix.TransformPoint(x, y);
 
-            float unityX = flashX - StageWidth / 2f;
-            float unityY = StageHeight / 2f - flashY;
+            float unityX = flashPoint.x - stageWidth / 2f;
+            float unityY = stageHeight / 2f - flashPoint.y;
 
             return new Vector3(
                 unityX / PixelsPerUnit,
@@ -80,14 +144,21 @@ namespace OpenSWFUnity.Runtime.Renderer
 
         private SwfMatrix CombineMatrix(SwfMatrix a, SwfMatrix b)
         {
-            return new SwfMatrix
-            {
-                ScaleX = a.ScaleX * b.ScaleX,
-                ScaleY = a.ScaleY * b.ScaleY,
+            return SwfMatrix.Combine(a, b);
+        }
 
-                TranslateX = a.TranslateX + b.TranslateX * a.ScaleX,
-                TranslateY = a.TranslateY + b.TranslateY * a.ScaleY
-            };
+        private static bool IsFinite(Vector3 value)
+        {
+            return
+                !float.IsNaN(value.x) && !float.IsInfinity(value.x) &&
+                !float.IsNaN(value.y) && !float.IsInfinity(value.y) &&
+                !float.IsNaN(value.z) && !float.IsInfinity(value.z);
+        }
+
+        private sealed class TextInstance
+        {
+            public GameObject GameObject;
+            public TextMesh TextMesh;
         }
     }
 }

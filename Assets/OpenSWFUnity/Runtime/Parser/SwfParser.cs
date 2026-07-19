@@ -12,6 +12,7 @@ namespace OpenSWFUnity.Runtime.Parser
         private byte[] data;
         private int position;
         public bool VerboseLogging = false;
+        public bool DiagnosticsLogging = true;
 
         public SwfHeader Header { get; private set; }
 
@@ -22,6 +23,10 @@ namespace OpenSWFUnity.Runtime.Parser
         public System.Collections.Generic.List<DefineSpriteTag> Sprites { get; private set; } = new System.Collections.Generic.List<DefineSpriteTag>();
         public System.Collections.Generic.List<DefineTextTag> Texts { get; private set; } = new System.Collections.Generic.List<DefineTextTag>();
         public System.Collections.Generic.List<DefineFont3Tag> Fonts3 { get; private set; } = new System.Collections.Generic.List<DefineFont3Tag>();
+        public List<DefineButton2Tag> Buttons2 { get; private set; } = new List<DefineButton2Tag>();
+        public List<DefineSoundTag> Sounds { get; private set; } = new List<DefineSoundTag>();
+        public Dictionary<string, ushort> ExportedAssets { get; private set; } = new Dictionary<string, ushort>();
+        public List<SwfFrame> RootFrames { get; private set; } = new List<SwfFrame>();
 
         public SetBackgroundColorTag BackgroundColor { get; private set; }
 
@@ -34,6 +39,8 @@ namespace OpenSWFUnity.Runtime.Parser
         public int DefineEditTextCount;
         public int CsmTextSettingsCount;
         public int FontAlignZonesCount;
+        public int DefineMorphShapeCount;
+        public int DefineMorphShape2Count;
 
         public SwfParser(byte[] swfBytes)
         {
@@ -167,7 +174,7 @@ namespace OpenSWFUnity.Runtime.Parser
 
             byte[] result = output.ToArray();
 
-            if (result.Length != uncompressedLength)
+            if (DiagnosticsLogging && result.Length != uncompressedLength)
             {
                 Debug.LogWarning(
                     "CWS decompressed size mismatch. Expected: " +
@@ -186,6 +193,12 @@ namespace OpenSWFUnity.Runtime.Parser
                 ParseHeader();
 
             Tags.Clear();
+            RootFrames.Clear();
+
+            SwfFrame currentRootFrame = new SwfFrame
+            {
+                FrameIndex = 0
+            };
 
             while (position < data.Length)
             {
@@ -213,6 +226,19 @@ namespace OpenSWFUnity.Runtime.Parser
 
                 Tags.Add(tag);
 
+                if (tagCode == 1) // ShowFrame
+                {
+                    RootFrames.Add(currentRootFrame);
+                    currentRootFrame = new SwfFrame
+                    {
+                        FrameIndex = RootFrames.Count
+                    };
+                }
+                else if (IsTimelineControlTag(tagCode))
+                {
+                    currentRootFrame.ControlTags.Add(tag);
+                }
+
                 if (VerboseLogging)
                     Debug.Log(tag.ToString());
                 ParseKnownTag(tag);
@@ -226,12 +252,42 @@ namespace OpenSWFUnity.Runtime.Parser
 
                 if (position > data.Length)
                 {
-                    Debug.LogError("Tag read past end of file at tag: " + tag.Name);
+                    if (DiagnosticsLogging)
+                        Debug.LogError("Tag read past end of file at tag: " + tag.Name);
                     break;
                 }
             }
 
+            if (currentRootFrame.ControlTags.Count > 0)
+            {
+                RootFrames.Add(currentRootFrame);
+            }
+
             return Tags;
+        }
+
+        private bool IsTimelineControlTag(int tagCode)
+        {
+            switch (tagCode)
+            {
+                case 4:  // PlaceObject
+                case 5:  // RemoveObject
+                case 12: // DoAction
+                case 15: // StartSound
+                case 18: // SoundStreamHead
+                case 19: // SoundStreamBlock
+                case 26: // PlaceObject2
+                case 28: // RemoveObject2
+                case 43: // FrameLabel
+                case 45: // SoundStreamHead2
+                case 59: // DoInitAction
+                case 70: // PlaceObject3
+                case 89: // StartSound2
+                    return true;
+
+                default:
+                    return false;
+            }
         }
 
         private void ParseKnownTag(SwfTag tag)
@@ -247,7 +303,8 @@ namespace OpenSWFUnity.Runtime.Parser
                         B = data[tag.DataStart + 2]
                     };
 
-                    Debug.Log(BackgroundColor.ToString());
+                    if (VerboseLogging)
+                        Debug.Log(BackgroundColor.ToString());
                 }
             }
 
@@ -256,9 +313,29 @@ namespace OpenSWFUnity.Runtime.Parser
                 ParseDefineShape(tag);
             }
 
-            if (tag.Code == 26)
+            if (tag.Code == 26 || tag.Code == 70)
             {
                 ParsePlaceObject2(tag);
+            }
+
+            if (tag.Code == 34)
+            {
+                ParseDefineButton2(tag);
+            }
+
+            if (tag.Code == 14)
+            {
+                ParseDefineSound(tag);
+            }
+
+            if (tag.Code == 56)
+            {
+                ParseExportAssets(tag);
+            }
+
+            if (tag.Code == 76)
+            {
+                ParseExportAssets(tag);
             }
 
             if (tag.Code == 39)
@@ -274,6 +351,36 @@ namespace OpenSWFUnity.Runtime.Parser
             if (tag.Code == 75)
             {
                 ParseDefineFont3(tag);
+            }
+
+            if (tag.Code == 46)
+            {
+                DefineMorphShapeCount++;
+
+                if (VerboseLogging)
+                {
+                    Debug.Log(
+                        "Found DefineMorphShape Code=46 Length=" +
+                        tag.Length +
+                        " DataStart=" +
+                        tag.DataStart
+                    );
+                }
+            }
+
+            if (tag.Code == 84)
+            {
+                DefineMorphShape2Count++;
+
+                if (VerboseLogging)
+                {
+                    Debug.Log(
+                        "Found DefineMorphShape2 Code=84 Length=" +
+                        tag.Length +
+                        " DataStart=" +
+                        tag.DataStart
+                    );
+                }
             }
 
             // Text / Font detection
@@ -357,6 +464,11 @@ namespace OpenSWFUnity.Runtime.Parser
         public ushort ParseRemoveObject2DepthFromTag(SwfTag tag)
         {
             return ReadUInt16LEAt(tag.DataStart);
+        }
+
+        public ushort ParseRemoveObjectDepthFromTag(SwfTag tag)
+        {
+            return ReadUInt16LEAt(tag.DataStart + 2);
         }
 
         private void ParseDefineSprite(SwfTag tag)
@@ -450,12 +562,15 @@ namespace OpenSWFUnity.Runtime.Parser
 
                 Sprites.Add(sprite);
 
-                Debug.Log(
-                    "Parsed Sprite Timeline. SpriteId=" + sprite.SpriteId +
-                    " DeclaredFrames=" + sprite.FrameCount +
-                    " ParsedFrames=" + sprite.Frames.Count +
-                    " ControlTags=" + sprite.ControlTags.Count
-                );
+                if (VerboseLogging)
+                {
+                    Debug.Log(
+                        "Parsed Sprite Timeline. SpriteId=" + sprite.SpriteId +
+                        " DeclaredFrames=" + sprite.FrameCount +
+                        " ParsedFrames=" + sprite.Frames.Count +
+                        " ControlTags=" + sprite.ControlTags.Count
+                    );
+                }
 
                 if (VerboseLogging)
                 {
@@ -467,8 +582,288 @@ namespace OpenSWFUnity.Runtime.Parser
             }
             catch (System.Exception e)
             {
-                Debug.LogWarning("Failed to parse DefineSprite at " + tag.DataStart + ": " + e.Message);
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineSprite at " + tag.DataStart + ": " + e.Message);
             }
+        }
+
+        private void ParseDefineButton2(SwfTag tag)
+        {
+            try
+            {
+                int p = tag.DataStart;
+                int tagEnd = tag.DataStart + tag.Length;
+
+                ushort buttonId = ReadUInt16LEAt(p);
+                p += 2;
+
+                byte flags = data[p++];
+                int actionOffsetField = p;
+                ushort actionOffset = ReadUInt16LEAt(p);
+                p += 2;
+
+                DefineButton2Tag button = new DefineButton2Tag
+                {
+                    ButtonId = buttonId,
+                    TrackAsMenu = (flags & 0x01) != 0
+                };
+
+                int characterEnd = actionOffset == 0
+                    ? tagEnd
+                    : actionOffsetField + actionOffset;
+
+                while (p < characterEnd)
+                {
+                    byte recordFlags = data[p++];
+
+                    if (recordFlags == 0)
+                        break;
+
+                    SwfButtonRecord record = new SwfButtonRecord
+                    {
+                        StateHitTest = (recordFlags & 0x08) != 0,
+                        StateDown = (recordFlags & 0x04) != 0,
+                        StateOver = (recordFlags & 0x02) != 0,
+                        StateUp = (recordFlags & 0x01) != 0,
+                        HasFilterList = (recordFlags & 0x10) != 0,
+                        HasBlendMode = (recordFlags & 0x20) != 0
+                    };
+
+                    record.CharacterId = ReadUInt16LEAt(p);
+                    p += 2;
+
+                    record.PlaceDepth = ReadUInt16LEAt(p);
+                    p += 2;
+
+                    record.Matrix = ReadMatrixAt(p, out int afterMatrix);
+                    p = afterMatrix;
+
+                    record.ColorTransform = ReadColorTransformWithAlpha(p, out int afterColorTransform);
+                    p = afterColorTransform;
+
+                    if (record.HasFilterList)
+                    {
+                        p = SkipFilterList(p);
+                    }
+
+                    if (record.HasBlendMode)
+                    {
+                        record.BlendMode = data[p++];
+                    }
+
+                    button.Records.Add(record);
+                }
+
+                if (actionOffset != 0)
+                {
+                    p = actionOffsetField + actionOffset;
+
+                    while (p + 4 <= tagEnd)
+                    {
+                        int actionRecordStart = p;
+                        ushort conditionActionSize = ReadUInt16LEAt(p);
+                        p += 2;
+
+                        ushort conditions = ReadUInt16LEAt(p);
+                        p += 2;
+
+                        int nextAction = conditionActionSize == 0
+                            ? tagEnd
+                            : actionRecordStart + conditionActionSize;
+
+                        nextAction = Mathf.Clamp(nextAction, p, tagEnd);
+
+                        byte[] actionBytes = new byte[nextAction - p];
+                        Array.Copy(data, p, actionBytes, 0, actionBytes.Length);
+
+                        button.Actions.Add(new SwfButtonCondAction
+                        {
+                            Conditions = conditions,
+                            ActionBytes = actionBytes
+                        });
+
+                        p = nextAction;
+
+                        if (conditionActionSize == 0)
+                            break;
+                    }
+                }
+
+                Buttons2.Add(button);
+
+                if (VerboseLogging)
+                {
+                    Debug.Log(button.ToString());
+                }
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineButton2 at " + tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        private void ParseDefineSound(SwfTag tag)
+        {
+            try
+            {
+                int p = tag.DataStart;
+                int tagEnd = tag.DataStart + tag.Length;
+
+                ushort soundId = ReadUInt16LEAt(p);
+                p += 2;
+
+                byte soundFlags = data[p++];
+                byte soundFormat = (byte)(soundFlags >> 4);
+                int rateCode = (soundFlags >> 2) & 0x03;
+
+                DefineSoundTag sound = new DefineSoundTag
+                {
+                    SoundId = soundId,
+                    SoundFormat = soundFormat,
+                    SampleRate = GetSoundSampleRate(rateCode),
+                    Is16Bit = (soundFlags & 0x02) != 0,
+                    IsStereo = (soundFlags & 0x01) != 0,
+                    SampleCount = ReadUInt32LEAt(p)
+                };
+
+                p += 4;
+
+                if (sound.IsMp3)
+                {
+                    sound.Mp3SeekSamples = (short)ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                int soundDataLength = Mathf.Max(0, tagEnd - p);
+                sound.SoundData = new byte[soundDataLength];
+                Array.Copy(data, p, sound.SoundData, 0, soundDataLength);
+
+                Sounds.Add(sound);
+
+                if (VerboseLogging)
+                    Debug.Log(sound.ToString());
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineSound at " + tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        private void ParseExportAssets(SwfTag tag)
+        {
+            try
+            {
+                int p = tag.DataStart;
+                int tagEnd = tag.DataStart + tag.Length;
+                ushort count = ReadUInt16LEAt(p);
+                p += 2;
+
+                for (int i = 0; i < count && p < tagEnd; i++)
+                {
+                    ushort characterId = ReadUInt16LEAt(p);
+                    p += 2;
+
+                    int nameStart = p;
+
+                    while (p < tagEnd && data[p] != 0)
+                        p++;
+
+                    string exportName = System.Text.Encoding.UTF8.GetString(
+                        data,
+                        nameStart,
+                        p - nameStart
+                    );
+
+                    if (p < tagEnd)
+                        p++;
+
+                    if (!string.IsNullOrEmpty(exportName))
+                    {
+                        ExportedAssets[exportName] = characterId;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse ExportAssets at " + tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        private int GetSoundSampleRate(int rateCode)
+        {
+            switch (rateCode)
+            {
+                case 0:
+                    return 5512;
+                case 1:
+                    return 11025;
+                case 2:
+                    return 22050;
+                default:
+                    return 44100;
+            }
+        }
+
+        private int SkipFilterList(int offset)
+        {
+            int p = offset;
+            int filterCount = data[p++];
+
+            for (int i = 0; i < filterCount; i++)
+            {
+                byte filterId = data[p++];
+
+                switch (filterId)
+                {
+                    case 0: // DropShadowFilter
+                        p += 23;
+                        break;
+
+                    case 1: // BlurFilter
+                        p += 9;
+                        break;
+
+                    case 2: // GlowFilter
+                        p += 15;
+                        break;
+
+                    case 3: // BevelFilter
+                        p += 27;
+                        break;
+
+                    case 4: // GradientGlowFilter
+                    case 7: // GradientBevelFilter
+                    {
+                        int colorCount = data[p++];
+                        p += colorCount * 4;
+                        p += colorCount;
+                        p += 19;
+                        break;
+                    }
+
+                    case 5: // ConvolutionFilter
+                    {
+                        int matrixX = data[p++];
+                        int matrixY = data[p++];
+                        p += 8;
+                        p += matrixX * matrixY * 4;
+                        p += 5;
+                        break;
+                    }
+
+                    case 6: // ColorMatrixFilter
+                        p += 80;
+                        break;
+
+                    default:
+                        throw new Exception("Unknown button filter id: " + filterId);
+                }
+            }
+
+            return p;
         }
 
         private void ParseDefineShape(SwfTag tag)
@@ -512,7 +907,8 @@ namespace OpenSWFUnity.Runtime.Parser
             }
             catch (System.Exception e)
             {
-                Debug.LogWarning("Failed to parse DefineShape at " + tag.DataStart + ": " + e.Message);
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineShape at " + tag.DataStart + ": " + e.Message);
             }
         }
 
@@ -562,7 +958,8 @@ namespace OpenSWFUnity.Runtime.Parser
             }
             catch (System.Exception e)
             {
-                Debug.LogWarning("Failed to parse PlaceObject2 at " + tag.DataStart + ": " + e.Message);
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse PlaceObject2 at " + tag.DataStart + ": " + e.Message);
             }
         }
 
@@ -588,6 +985,52 @@ namespace OpenSWFUnity.Runtime.Parser
             return null;
         }
 
+        public DefineButton2Tag FindButton2ById(ushort id)
+        {
+            for (int i = 0; i < Buttons2.Count; i++)
+            {
+                if (Buttons2[i].ButtonId == id)
+                    return Buttons2[i];
+            }
+
+            return null;
+        }
+
+        public DefineSoundTag FindSoundById(ushort id)
+        {
+            for (int i = 0; i < Sounds.Count; i++)
+            {
+                if (Sounds[i].SoundId == id)
+                    return Sounds[i];
+            }
+
+            return null;
+        }
+
+        public DefineSoundTag FindExportedSound(string exportName)
+        {
+            if (string.IsNullOrEmpty(exportName))
+                return null;
+
+            if (!ExportedAssets.TryGetValue(exportName, out ushort characterId))
+                return null;
+
+            return FindSoundById(characterId);
+        }
+
+        public byte[] CopyTagData(SwfTag tag, int skipBytes = 0)
+        {
+            if (tag == null)
+                return new byte[0];
+
+            int skip = Mathf.Clamp(skipBytes, 0, tag.Length);
+            int start = Mathf.Clamp(tag.DataStart + skip, 0, data.Length);
+            int length = Mathf.Clamp(tag.Length - skip, 0, data.Length - start);
+            byte[] result = new byte[length];
+            Array.Copy(data, start, result, 0, length);
+            return result;
+        }
+
         private byte ReadByteAt(int offset)
         {
             return data[offset];
@@ -599,6 +1042,9 @@ namespace OpenSWFUnity.Runtime.Parser
 
             byte flags = data[p];
             p++;
+            byte extendedFlags = tag.Code == 70 && p < tag.DataStart + tag.Length
+                ? data[p++]
+                : (byte)0;
 
             PlaceObject2Tag place = new PlaceObject2Tag
             {
@@ -610,11 +1056,23 @@ namespace OpenSWFUnity.Runtime.Parser
                 HasMatrix = (flags & 0x04) != 0,
                 HasCharacter = (flags & 0x02) != 0,
                 Move = (flags & 0x01) != 0,
-                HasMove = (flags & 0x01) != 0
+                HasMove = (flags & 0x01) != 0,
+                HasFilterList = (extendedFlags & 0x01) != 0,
+                HasBlendMode = (extendedFlags & 0x02) != 0,
+                HasCacheAsBitmap = (extendedFlags & 0x04) != 0,
+                HasClassName = (extendedFlags & 0x08) != 0,
+                HasVisible = (extendedFlags & 0x20) != 0,
+                HasOpaqueBackground = (extendedFlags & 0x40) != 0
             };
 
             place.Depth = ReadUInt16LEAt(p);
             p += 2;
+
+            if (place.HasClassName ||
+                (tag.Code == 70 && (extendedFlags & 0x10) != 0 && place.HasCharacter))
+            {
+                place.ClassName = ReadNullTerminatedString(ref p, tag.DataStart + tag.Length);
+            }
 
             if (place.HasCharacter)
             {
@@ -637,8 +1095,187 @@ namespace OpenSWFUnity.Runtime.Parser
                 place.ColorTransform = ReadColorTransformWithAlpha(p, out int afterCxForm);
                 p = afterCxForm;
             }
+            else
+            {
+                place.ColorTransform = SwfColorTransform.Identity;
+            }
+
+            if (place.HasRatio)
+            {
+                place.Ratio = ReadUInt16LEAt(p);
+                p += 2;
+            }
+
+            if (place.HasName)
+            {
+                int nameStart = p;
+
+                while (p < tag.DataStart + tag.Length && data[p] != 0)
+                {
+                    p++;
+                }
+
+                int nameLength = p - nameStart;
+
+                if (nameLength > 0)
+                {
+                    place.Name = System.Text.Encoding.UTF8.GetString(data, nameStart, nameLength);
+                }
+                else
+                {
+                    place.Name = "";
+                }
+
+                // Skip null terminator.
+                if (p < tag.DataStart + tag.Length)
+                {
+                    p++;
+                }
+            }
+
+            if (place.HasClipDepth)
+            {
+                place.ClipDepth = ReadUInt16LEAt(p);
+                p += 2;
+            }
+
+            if (place.HasFilterList)
+                SkipFilterList(ref p, tag.DataStart + tag.Length);
+
+            if (place.HasBlendMode && p < tag.DataStart + tag.Length)
+                place.BlendMode = data[p++];
+
+            if (place.HasCacheAsBitmap && p < tag.DataStart + tag.Length)
+                place.BitmapCache = data[p++];
+
+            if (place.HasVisible && p < tag.DataStart + tag.Length)
+                place.Visible = data[p++];
+
+            if (place.HasOpaqueBackground && p + 4 <= tag.DataStart + tag.Length)
+                p += 4;
+
+            if (place.HasClipActions)
+                ReadClipActions(place, ref p, tag.DataStart + tag.Length);
+
+            if (VerboseLogging && (place.HasClipDepth || place.HasRatio))
+            {
+                Debug.Log(
+                    "PLACE SPECIAL " +
+                    "Depth=" + place.Depth +
+                    " Char=" + place.CharacterId +
+                    " HasClipDepth=" + place.HasClipDepth +
+                    " ClipDepth=" + place.ClipDepth +
+                    " HasRatio=" + place.HasRatio +
+                    " Ratio=" + place.Ratio +
+                    " HasCX=" + place.HasColorTransform
+                );
+            }
 
             return place;
+        }
+
+        private string ReadNullTerminatedString(ref int p, int end)
+        {
+            int start = p;
+
+            while (p < end && data[p] != 0)
+                p++;
+
+            string value = System.Text.Encoding.UTF8.GetString(data, start, p - start);
+
+            if (p < end)
+                p++;
+
+            return value;
+        }
+
+        private void SkipFilterList(ref int p, int end)
+        {
+            if (p >= end)
+                return;
+
+            int count = data[p++];
+
+            for (int i = 0; i < count && p < end; i++)
+            {
+                byte filterId = data[p++];
+                int fixedLength;
+
+                switch (filterId)
+                {
+                    case 0: fixedLength = 23; break; // DropShadow
+                    case 1: fixedLength = 9; break;  // Blur
+                    case 2: fixedLength = 15; break; // Glow
+                    case 3: fixedLength = 27; break; // Bevel
+                    case 4:
+                    case 7:
+                    {
+                        int colors = p < end ? data[p++] : 0;
+                        fixedLength = colors * 5 + 19;
+                        break;
+                    }
+                    case 5:
+                    {
+                        int matrixX = p < end ? data[p++] : 0;
+                        int matrixY = p < end ? data[p++] : 0;
+                        fixedLength = 13 + matrixX * matrixY * 4;
+                        break;
+                    }
+                    case 6: fixedLength = 80; break; // ColorMatrix
+                    default:
+                        p = end;
+                        return;
+                }
+
+                p = Math.Min(end, p + fixedLength);
+            }
+        }
+
+        private void ReadClipActions(PlaceObject2Tag place, ref int p, int end)
+        {
+            if (place == null || p + 2 > end)
+                return;
+
+            p += 2; // Reserved
+            int eventFlagSize = Header != null && Header.Version >= 6 ? 4 : 2;
+
+            if (p + eventFlagSize > end)
+                return;
+
+            p += eventFlagSize; // AllEventFlags
+
+            while (p + eventFlagSize <= end)
+            {
+                uint eventFlags = eventFlagSize == 4
+                    ? ReadUInt32LEAt(p)
+                    : ReadUInt16LEAt(p);
+                p += eventFlagSize;
+
+                if (eventFlags == 0)
+                    break;
+
+                if (p + 4 > end)
+                    break;
+
+                int actionRecordSize = (int)ReadUInt32LEAt(p);
+                p += 4;
+                int recordEnd = Math.Min(end, p + Math.Max(0, actionRecordSize));
+                byte keyCode = 0;
+
+                if ((eventFlags & 0x00020000u) != 0 && p < recordEnd)
+                    keyCode = data[p++];
+
+                int actionLength = Math.Max(0, recordEnd - p);
+                byte[] actions = new byte[actionLength];
+                Array.Copy(data, p, actions, 0, actionLength);
+                place.ClipActions.Add(new SwfClipActionRecord
+                {
+                    EventFlags = eventFlags,
+                    KeyCode = keyCode,
+                    ActionBytes = actions
+                });
+                p = recordEnd;
+            }
         }
 
         private SwfColorTransform ReadColorTransformWithAlpha(int offset, out int afterOffset)
@@ -779,7 +1416,8 @@ namespace OpenSWFUnity.Runtime.Parser
             }
             else
             {
-                UnityEngine.Debug.LogWarning("Unknown FillStyleType: 0x" + fill.FillType.ToString("X2"));
+                if (DiagnosticsLogging)
+                    UnityEngine.Debug.LogWarning("Unknown FillStyleType: 0x" + fill.FillType.ToString("X2"));
                 shapeData.FillStyles.Add(fill);
             }
 
@@ -1382,42 +2020,46 @@ namespace OpenSWFUnity.Runtime.Parser
 
                 Texts.Add(text);
 
-                Debug.Log(text.ToString());
-
-                for (int i = 0; i < text.Records.Count; i++)
+                if (VerboseLogging)
                 {
-                    SwfTextRecord record = text.Records[i];
+                    Debug.Log(text.ToString());
 
-                    Debug.Log("  " + record.ToString());
-
-                    string decoded = DecodeTextRecord(record);
-                    Debug.Log("  Decoded Text: \"" + decoded + "\"");
-
-                    int max = System.Math.Min(10, record.GlyphEntries.Count);
-                    for (int g = 0; g < max; g++)
+                    for (int i = 0; i < text.Records.Count; i++)
                     {
-                        SwfGlyphEntry entry = record.GlyphEntries[g];
+                        SwfTextRecord record = text.Records[i];
 
-                        char ch = '?';
+                        Debug.Log("  " + record.ToString());
 
-                        DefineFont3Tag font = FindFont3ById(record.FontId);
+                        string decoded = DecodeTextRecord(record);
+                        Debug.Log("  Decoded Text: \"" + decoded + "\"");
 
-                        if (font != null && entry.GlyphIndex >= 0 && entry.GlyphIndex < font.CodeTable.Count)
+                        int max = System.Math.Min(10, record.GlyphEntries.Count);
+                        for (int g = 0; g < max; g++)
                         {
-                            ch = (char)font.CodeTable[entry.GlyphIndex];
-                        }
+                            SwfGlyphEntry entry = record.GlyphEntries[g];
 
-                        Debug.Log(
-                            "    Glyph Index=" + entry.GlyphIndex +
-                            " Char='" + ch +
-                            "' Advance=" + entry.GlyphAdvance
-                        );
+                            char ch = '?';
+
+                            DefineFont3Tag font = FindFont3ById(record.FontId);
+
+                            if (font != null && entry.GlyphIndex >= 0 && entry.GlyphIndex < font.CodeTable.Count)
+                            {
+                                ch = (char)font.CodeTable[entry.GlyphIndex];
+                            }
+
+                            Debug.Log(
+                                "    Glyph Index=" + entry.GlyphIndex +
+                                " Char='" + ch +
+                                "' Advance=" + entry.GlyphAdvance
+                            );
+                        }
                     }
                 }
             }
             catch (System.Exception e)
             {
-                Debug.LogWarning("Failed to parse DefineText at " + tag.DataStart + ": " + e.Message);
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineText at " + tag.DataStart + ": " + e.Message);
             }
         }
 
@@ -1436,7 +2078,8 @@ namespace OpenSWFUnity.Runtime.Parser
 
                 if (!isTextRecord)
                 {
-                    Debug.LogWarning("Unknown text record header: " + recordHeader);
+                    if (DiagnosticsLogging)
+                        Debug.LogWarning("Unknown text record header: " + recordHeader);
                     break;
                 }
 
@@ -1596,24 +2239,28 @@ namespace OpenSWFUnity.Runtime.Parser
 
                 Fonts3.Add(font);
 
-                Debug.Log(font.ToString());
-
-                int max = System.Math.Min(30, font.CodeTable.Count);
-
-                for (int i = 0; i < max; i++)
+                if (VerboseLogging)
                 {
-                    int code = font.CodeTable[i];
+                    Debug.Log(font.ToString());
 
-                    Debug.Log(
-                        "  Font glyph " + i +
-                        " -> code " + code +
-                        " char '" + (char)code + "'"
-                    );
+                    int max = System.Math.Min(30, font.CodeTable.Count);
+
+                    for (int i = 0; i < max; i++)
+                    {
+                        int code = font.CodeTable[i];
+
+                        Debug.Log(
+                            "  Font glyph " + i +
+                            " -> code " + code +
+                            " char '" + (char)code + "'"
+                        );
+                    }
                 }
             }
             catch (System.Exception e)
             {
-                Debug.LogWarning("Failed to parse DefineFont3 at " + tag.DataStart + ": " + e.Message);
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineFont3 at " + tag.DataStart + ": " + e.Message);
             }
         }
 
