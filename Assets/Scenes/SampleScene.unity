@@ -148,16 +148,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 62c2c021566a9664d89159c31f4dc2cc, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::OpenSWFUnity.Runtime.SwfPlayer
-  swfFile: {fileID: 4900000, guid: 3f5a3fed73136884f86616e5b147e261, type: 3}
+  swfFile: {fileID: -6750239444755058063, guid: 40110583f7747f74ca3afacb7ef3a389, type: 3}
   showLibraryOnStart: 0
   renderQuality: 1
   applyBackgroundColor: 1
   enableShapeOutlines: 0
   enableTimelinePlayback: 1
   debugFrame: 0
-  autoPlayTimeline: 1
   loopSpriteTimelines: 1
-  verboseLogging: 0
+  verboseLogging: 1
   enableDebugLines: 0
   debugOnlyCharacterId: 0
   enableFillContourDebug: 0

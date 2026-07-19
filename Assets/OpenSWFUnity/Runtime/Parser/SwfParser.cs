@@ -18,6 +18,9 @@ namespace OpenSWFUnity.Runtime.Parser
 
         public List<SwfTag> Tags { get; private set; } = new List<SwfTag>();
 
+        public System.Collections.Generic.List<DefineBitmapTag> Bitmaps { get; private set; } = new System.Collections.Generic.List<DefineBitmapTag>();
+        public byte[] JpegTables { get; private set; }
+
         public System.Collections.Generic.List<DefineShapeTag> Shapes { get; private set; } = new System.Collections.Generic.List<DefineShapeTag>();
         public System.Collections.Generic.List<PlaceObject2Tag> PlacedObjects { get; private set; } = new System.Collections.Generic.List<PlaceObject2Tag>();
         public System.Collections.Generic.List<DefineSpriteTag> Sprites { get; private set; } = new System.Collections.Generic.List<DefineSpriteTag>();
@@ -128,6 +131,235 @@ namespace OpenSWFUnity.Runtime.Parser
         private uint ReadUInt32LE(int offset)
         {
             return BitConverter.ToUInt32(data, offset);
+        }
+
+        private static byte[] InflateZlib(byte[] source, int offset, int length)
+        {
+            if (source == null || offset < 0 || length <= 0 || offset + length > source.Length)
+                return new byte[0];
+
+            // Skip the 2-byte zlib header when present; DeflateStream wants raw deflate.
+            int start = offset;
+            int count = length;
+
+            if (count > 2 && source[start] == 0x78)
+            {
+                start += 2;
+                count -= 2;
+            }
+
+            using MemoryStream input = new MemoryStream(source, start, count);
+            using DeflateStream deflate = new DeflateStream(input, CompressionMode.Decompress);
+            using MemoryStream output = new MemoryStream();
+            deflate.CopyTo(output);
+            return output.ToArray();
+        }
+
+        private void ParseDefineBitsLossless(SwfTag tag, bool hasAlpha)
+        {
+            try
+            {
+                int p = tag.DataStart;
+                ushort characterId = ReadUInt16LEAt(p); p += 2;
+                byte format = data[p]; p += 1;
+                int width = ReadUInt16LEAt(p); p += 2;
+                int height = ReadUInt16LEAt(p); p += 2;
+
+                int colorTableSize = 0;
+
+                if (format == 3)
+                {
+                    colorTableSize = ReadByteAt(p) + 1;
+                    p += 1;
+                }
+
+                if (width <= 0 || height <= 0)
+                    return;
+
+                int remaining = tag.DataStart + tag.Length - p;
+                byte[] pixelData = InflateZlib(data, p, remaining);
+
+                if (pixelData.Length == 0)
+                    return;
+
+                Color32[] pixels = new Color32[width * height];
+                int cursor = 0;
+
+                if (format == 3)
+                {
+                    // Palette entries are RGB for Lossless and RGBA for Lossless2.
+                    int entrySize = hasAlpha ? 4 : 3;
+                    Color32[] palette = new Color32[colorTableSize];
+
+                    for (int i = 0; i < colorTableSize && cursor + entrySize <= pixelData.Length; i++)
+                    {
+                        byte r = pixelData[cursor];
+                        byte g = pixelData[cursor + 1];
+                        byte b = pixelData[cursor + 2];
+                        byte a = hasAlpha ? pixelData[cursor + 3] : (byte)255;
+                        cursor += entrySize;
+                        palette[i] = UnmultiplyAlpha(r, g, b, a, hasAlpha);
+                    }
+
+                    // Each row of indices is padded out to a 32-bit boundary.
+                    int rowStride = (width + 3) & ~3;
+
+                    for (int y = 0; y < height; y++)
+                    {
+                        int rowStart = cursor + y * rowStride;
+
+                        for (int x = 0; x < width; x++)
+                        {
+                            int offset = rowStart + x;
+                            int index = offset < pixelData.Length ? pixelData[offset] : 0;
+                            pixels[y * width + x] = index < palette.Length
+                                ? palette[index]
+                                : new Color32(0, 0, 0, 0);
+                        }
+                    }
+                }
+                else if (format == 4)
+                {
+                    // PIX15: 16-bit, one padding bit then 5 bits per channel.
+                    int rowStride = ((width * 2) + 3) & ~3;
+
+                    for (int y = 0; y < height; y++)
+                    {
+                        int rowStart = y * rowStride;
+
+                        for (int x = 0; x < width; x++)
+                        {
+                            int offset = rowStart + x * 2;
+
+                            if (offset + 1 >= pixelData.Length)
+                                continue;
+
+                            int value = (pixelData[offset] << 8) | pixelData[offset + 1];
+                            byte r = (byte)(((value >> 10) & 0x1F) * 255 / 31);
+                            byte g = (byte)(((value >> 5) & 0x1F) * 255 / 31);
+                            byte b = (byte)((value & 0x1F) * 255 / 31);
+                            pixels[y * width + x] = new Color32(r, g, b, 255);
+                        }
+                    }
+                }
+                else
+                {
+                    // Format 5: 32 bits per pixel. Lossless stores XRGB (X unused),
+                    // Lossless2 stores ARGB with colours already premultiplied.
+                    for (int i = 0; i < width * height; i++)
+                    {
+                        int offset = i * 4;
+
+                        if (offset + 3 >= pixelData.Length)
+                            break;
+
+                        byte a = hasAlpha ? pixelData[offset] : (byte)255;
+                        byte r = pixelData[offset + 1];
+                        byte g = pixelData[offset + 2];
+                        byte b = pixelData[offset + 3];
+                        pixels[i] = UnmultiplyAlpha(r, g, b, a, hasAlpha);
+                    }
+                }
+
+                Bitmaps.Add(new DefineBitmapTag
+                {
+                    CharacterId = characterId,
+                    Width = width,
+                    Height = height,
+                    Pixels = pixels
+                });
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineBitsLossless: " + e.Message);
+            }
+        }
+
+        private static Color32 UnmultiplyAlpha(byte r, byte g, byte b, byte a, bool premultiplied)
+        {
+            if (!premultiplied || a == 0 || a == 255)
+                return new Color32(r, g, b, a);
+
+            return new Color32(
+                (byte)Mathf.Min(255, r * 255 / a),
+                (byte)Mathf.Min(255, g * 255 / a),
+                (byte)Mathf.Min(255, b * 255 / a),
+                a
+            );
+        }
+
+        private void ParseDefineBitsJpeg(SwfTag tag, int tagCode)
+        {
+            try
+            {
+                int p = tag.DataStart;
+                ushort characterId = ReadUInt16LEAt(p); p += 2;
+                int end = tag.DataStart + tag.Length;
+                byte[] alpha = null;
+                int jpegEnd = end;
+
+                if (tagCode == 35 || tagCode == 90)
+                {
+                    // JPEG3/4 prefix the image with its own length; the remainder
+                    // of the tag is a zlib-compressed alpha channel.
+                    uint jpegLength = ReadUInt32LEAt(p); p += 4;
+
+                    if (tagCode == 90)
+                        p += 2; // DefineBitsJPEG4 deblocking parameter
+
+                    jpegEnd = Math.Min(end, p + (int)jpegLength);
+
+                    if (jpegEnd < end)
+                        alpha = InflateZlib(data, jpegEnd, end - jpegEnd);
+                }
+
+                int jpegLen = Math.Max(0, jpegEnd - p);
+
+                if (jpegLen <= 0)
+                    return;
+
+                byte[] jpeg;
+
+                if (tagCode == 6 && JpegTables != null && JpegTables.Length > 2)
+                {
+                    // DefineBits shares its encoding tables with the JPEGTables tag;
+                    // splice them together, dropping the tables' trailing EOI marker
+                    // and the image's leading SOI marker.
+                    byte[] merged = new byte[JpegTables.Length - 2 + jpegLen - 2];
+                    Array.Copy(JpegTables, 0, merged, 0, JpegTables.Length - 2);
+                    Array.Copy(data, p + 2, merged, JpegTables.Length - 2, jpegLen - 2);
+                    jpeg = merged;
+                }
+                else
+                {
+                    jpeg = new byte[jpegLen];
+                    Array.Copy(data, p, jpeg, 0, jpegLen);
+                }
+
+                Bitmaps.Add(new DefineBitmapTag
+                {
+                    CharacterId = characterId,
+                    EncodedJpeg = jpeg,
+                    JpegAlpha = alpha
+                });
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineBitsJPEG: " + e.Message);
+            }
+        }
+
+        public DefineBitmapTag FindBitmapById(ushort id)
+        {
+            for (int i = 0; i < Bitmaps.Count; i++)
+            {
+                if (Bitmaps[i].CharacterId == id)
+                    return Bitmaps[i];
+            }
+
+            return null;
         }
 
         private byte[] DecompressCws(byte[] compressedSwf)
@@ -311,6 +543,26 @@ namespace OpenSWFUnity.Runtime.Parser
             if (tag.Code == 2 || tag.Code == 22 || tag.Code == 32 || tag.Code == 83)
             {
                 ParseDefineShape(tag);
+            }
+
+            if (tag.Code == 8) // JPEGTables: shared encoding tables for DefineBits
+            {
+                JpegTables = CopyTagData(tag);
+            }
+
+            if (tag.Code == 20) // DefineBitsLossless (no alpha)
+            {
+                ParseDefineBitsLossless(tag, false);
+            }
+
+            if (tag.Code == 36) // DefineBitsLossless2 (alpha, premultiplied)
+            {
+                ParseDefineBitsLossless(tag, true);
+            }
+
+            if (tag.Code == 6 || tag.Code == 21 || tag.Code == 35 || tag.Code == 90)
+            {
+                ParseDefineBitsJpeg(tag, tag.Code);
             }
 
             if (tag.Code == 26 || tag.Code == 70)
@@ -878,9 +1130,26 @@ namespace OpenSWFUnity.Runtime.Parser
                 SwfRect bounds = ReadRectAt(p, out int afterBounds);
                 p = afterBounds;
 
+                int shapeVersion = tag.Code == 2 ? 1
+                    : tag.Code == 22 ? 2
+                    : tag.Code == 32 ? 3
+                    : tag.Code == 83 ? 4
+                    : 1;
+
+                if (shapeVersion == 4)
+                {
+                    // DefineShape4 additionally carries an EdgeBounds RECT and a
+                    // one-byte flag field (reserved / non-scaling / scaling / winding rule)
+                    // before the fill/line style arrays begin.
+                    ReadRectAt(p, out int afterEdgeBounds);
+                    p = afterEdgeBounds;
+                    p += 1;
+                }
+
                 SwfShapeData shapeData = ParseShapeStylesOnly(
                     characterId,
                     p,
+                    shapeVersion,
                     out int afterStyles
                 );
 
@@ -1314,13 +1583,14 @@ namespace OpenSWFUnity.Runtime.Parser
             return cx;
         }
 
-        private SwfShapeData ParseShapeStylesOnly(ushort characterId, int offset, out int afterStylesPosition)
+        private SwfShapeData ParseShapeStylesOnly(ushort characterId, int offset, int shapeVersion, out int afterStylesPosition)
         {
             int p = offset;
 
             SwfShapeData shapeData = new SwfShapeData
             {
-                CharacterId = characterId
+                CharacterId = characterId,
+                ShapeVersion = shapeVersion
             };
 
             int fillStyleCount = ReadByteAt(p);
@@ -1336,7 +1606,7 @@ namespace OpenSWFUnity.Runtime.Parser
 
             for (int i = 0; i < fillStyleCount; i++)
             {
-                p = ReadFillStyle(p, shapeData);
+                p = ReadFillStyle(p, shapeData, shapeVersion);
             }
 
             int lineStyleCount = ReadByteAt(p);
@@ -1352,7 +1622,7 @@ namespace OpenSWFUnity.Runtime.Parser
 
             for (int i = 0; i < lineStyleCount; i++)
             {
-                p = SkipLineStyle(p);
+                p = ReadLineStyle(p, shapeData, shapeVersion);
             }
 
             SwfBitReader reader = new SwfBitReader(data, p);
@@ -1367,37 +1637,62 @@ namespace OpenSWFUnity.Runtime.Parser
             return shapeData;
         }
 
-        private int ReadFillStyle(int p, SwfShapeData shapeData)
+        private int ReadFillStyle(int p, SwfShapeData shapeData, int shapeVersion)
         {
             SwfFillStyle fill = new SwfFillStyle();
 
             fill.FillType = data[p];
             p++;
 
-            // 0x00 = solid fill RGB for DefineShape v1
+            // DefineShape/DefineShape2 (v1/v2) use RGB solid/gradient colors.
+            // DefineShape3/DefineShape4 (v3/v4) use RGBA throughout.
+            bool useRgba = shapeVersion >= 3;
+
             if (fill.FillType == 0x00)
             {
                 fill.R = data[p];
                 fill.G = data[p + 1];
                 fill.B = data[p + 2];
-                fill.A = 255;
+                fill.A = useRgba ? data[p + 3] : (byte)255;
 
-                p += 3;
+                p += useRgba ? 4 : 3;
 
                 shapeData.FillStyles.Add(fill);
             }
-            // Gradient fill
+            // Gradient fill (0x10 linear, 0x12 radial, 0x13 focal radial - v4 only)
             else if (fill.FillType == 0x10 || fill.FillType == 0x12 || fill.FillType == 0x13)
             {
-                p = SkipMatrix(p);
+                fill.GradientMatrix = ReadMatrixAt(p, out p);
 
                 byte gradientInfo = data[p];
                 p++;
 
                 int numGradients = gradientInfo & 0x0F;
+                fill.GradientStops = new List<SwfGradientStop>(numGradients);
 
-                // ratio + RGB
-                p += numGradients * 4;
+                for (int i = 0; i < numGradients; i++)
+                {
+                    byte ratio = data[p];
+                    p++;
+
+                    byte r = data[p];
+                    byte g = data[p + 1];
+                    byte b = data[p + 2];
+                    byte a = useRgba ? data[p + 3] : (byte)255;
+                    p += useRgba ? 4 : 3;
+
+                    fill.GradientStops.Add(new SwfGradientStop
+                    {
+                        Ratio = ratio,
+                        Color = new Color(r / 255f, g / 255f, b / 255f, a / 255f)
+                    });
+                }
+
+                if (fill.FillType == 0x13)
+                {
+                    fill.FocalPoint = (short)ReadUInt16LEAt(p) / 256f;
+                    p += 2;
+                }
 
                 shapeData.FillStyles.Add(fill);
             }
@@ -1409,8 +1704,12 @@ namespace OpenSWFUnity.Runtime.Parser
                 fill.FillType == 0x43
             )
             {
-                p += 2; // bitmapId
-                p = SkipMatrix(p);
+                fill.BitmapId = ReadUInt16LEAt(p);
+                p += 2;
+
+                fill.BitmapMatrix = ReadMatrixAt(p, out p);
+                fill.BitmapSmoothed = fill.FillType == 0x40 || fill.FillType == 0x41;
+                fill.BitmapClipped = fill.FillType == 0x41 || fill.FillType == 0x43;
 
                 shapeData.FillStyles.Add(fill);
             }
@@ -1424,20 +1723,70 @@ namespace OpenSWFUnity.Runtime.Parser
             return p;
         }
 
-        private int SkipLineStyle(int p)
+        private int ReadLineStyle(int p, SwfShapeData shapeData, int shapeVersion)
         {
-            p += 2; // width
+            SwfLineStyle line = new SwfLineStyle();
 
-            // DefineShape line style uses RGB = 3 bytes.
-            p += 3;
+            line.Width = ReadUInt16LEAt(p) / 20f;
+            p += 2;
 
+            if (shapeVersion < 4)
+            {
+                // LINESTYLE: RGB for v1/v2, RGBA for v3.
+                bool useRgba = shapeVersion >= 3;
+
+                byte r = data[p];
+                byte g = data[p + 1];
+                byte b = data[p + 2];
+                byte a = useRgba ? data[p + 3] : (byte)255;
+                p += useRgba ? 4 : 3;
+
+                line.Color = new Color(r / 255f, g / 255f, b / 255f, a / 255f);
+            }
+            else
+            {
+                // LINESTYLE2 (DefineShape4): caps/joins/scaling flags, optional
+                // miter limit, and either a solid RGBA color or a fill style.
+                SwfBitReader reader = new SwfBitReader(data, p);
+
+                line.StartCapStyle = (int)reader.ReadUBits(2);
+                line.JoinStyle = (int)reader.ReadUBits(2);
+                line.HasFillStyle = reader.ReadUBits(1) == 1;
+                line.NoHScale = reader.ReadUBits(1) == 1;
+                line.NoVScale = reader.ReadUBits(1) == 1;
+                line.PixelHinting = reader.ReadUBits(1) == 1;
+                reader.ReadUBits(5); // reserved
+                line.NoClose = reader.ReadUBits(1) == 1;
+                line.EndCapStyle = (int)reader.ReadUBits(2);
+
+                reader.AlignToByte();
+                p = reader.BytePosition;
+
+                if (line.JoinStyle == 2)
+                {
+                    line.MiterLimitFactor = (short)ReadUInt16LEAt(p) / 256f;
+                    p += 2;
+                }
+
+                if (line.HasFillStyle)
+                {
+                    line.FillStyleIndex = shapeData.FillStyles.Count;
+                    p = ReadFillStyle(p, shapeData, shapeVersion);
+                }
+                else
+                {
+                    byte r = data[p];
+                    byte g = data[p + 1];
+                    byte b = data[p + 2];
+                    byte a = data[p + 3];
+                    p += 4;
+
+                    line.Color = new Color(r / 255f, g / 255f, b / 255f, a / 255f);
+                }
+            }
+
+            shapeData.LineStyles.Add(line);
             return p;
-        }
-
-        private int SkipMatrix(int offset)
-        {
-            ReadMatrixAt(offset, out int afterMatrix);
-            return afterMatrix;
         }
 
         private void ParseShapeRecords(SwfShapeData shapeData, int offset)
@@ -1455,6 +1804,9 @@ namespace OpenSWFUnity.Runtime.Parser
             int currentLineStyle = 0;
 
             SwfShapePath currentPath = null;
+
+            int fillIndexOffset = 0;
+            int lineIndexOffset = 0;
 
             int safety = 0;
 
@@ -1493,17 +1845,20 @@ namespace OpenSWFUnity.Runtime.Parser
 
                     if (stateFillStyle0)
                     {
-                        currentFillStyle0 = (int)reader.ReadUBits(numFillBits);
+                        int localIndex = (int)reader.ReadUBits(numFillBits);
+                        currentFillStyle0 = localIndex == 0 ? 0 : localIndex + fillIndexOffset;
                     }
 
                     if (stateFillStyle1)
                     {
-                        currentFillStyle1 = (int)reader.ReadUBits(numFillBits);
+                        int localIndex = (int)reader.ReadUBits(numFillBits);
+                        currentFillStyle1 = localIndex == 0 ? 0 : localIndex + fillIndexOffset;
                     }
 
                     if (stateLineStyle)
                     {
-                        currentLineStyle = (int)reader.ReadUBits(numLineBits);
+                        int localIndex = (int)reader.ReadUBits(numLineBits);
+                        currentLineStyle = localIndex == 0 ? 0 : localIndex + lineIndexOffset;
                     }
 
                     bool styleChanged =
@@ -1528,8 +1883,50 @@ namespace OpenSWFUnity.Runtime.Parser
 
                     if (stateNewStyles)
                     {
-                        // New styles inside shape records are not supported yet.
-                        break;
+                        // A fresh FillStyleArray/LineStyleArray follows, byte-aligned.
+                        // Style indices read after this point are local to the new
+                        // arrays, so remember the offset needed to map them into the
+                        // single combined FillStyles/LineStyles lists on shapeData.
+                        reader.AlignToByte();
+                        int bytePos = reader.BytePosition;
+
+                        int newFillCount = ReadByteAt(bytePos);
+                        bytePos++;
+
+                        if (newFillCount == 0xFF)
+                        {
+                            newFillCount = ReadUInt16LEAt(bytePos);
+                            bytePos += 2;
+                        }
+
+                        int fillBaseIndex = shapeData.FillStyles.Count;
+
+                        for (int i = 0; i < newFillCount; i++)
+                            bytePos = ReadFillStyle(bytePos, shapeData, shapeData.ShapeVersion);
+
+                        int newLineCount = ReadByteAt(bytePos);
+                        bytePos++;
+
+                        if (newLineCount == 0xFF)
+                        {
+                            newLineCount = ReadUInt16LEAt(bytePos);
+                            bytePos += 2;
+                        }
+
+                        int lineBaseIndex = shapeData.LineStyles.Count;
+
+                        for (int i = 0; i < newLineCount; i++)
+                            bytePos = ReadLineStyle(bytePos, shapeData, shapeData.ShapeVersion);
+
+                        reader = new SwfBitReader(data, bytePos);
+                        numFillBits = (int)reader.ReadUBits(4);
+                        numLineBits = (int)reader.ReadUBits(4);
+
+                        fillIndexOffset = fillBaseIndex;
+                        lineIndexOffset = lineBaseIndex;
+                        currentFillStyle0 = 0;
+                        currentFillStyle1 = 0;
+                        currentLineStyle = 0;
                     }
 
                     if (stateMoveTo)
@@ -1861,66 +2258,123 @@ namespace OpenSWFUnity.Runtime.Parser
                 SwfFillEdgeGroup group = shapeData.FillEdgeGroups[g];
 
                 group.Contours.Clear();
-
-                List<SwfShapeEdge> remaining = new List<SwfShapeEdge>(group.Edges);
-
-                while (remaining.Count > 0)
-                {
-                    SwfShapeEdge startEdge = remaining[0];
-                    remaining.RemoveAt(0);
-
-                    SwfFillContour contour = new SwfFillContour
-                    {
-                        FillStyleIndex = group.FillStyleIndex
-                    };
-
-                    contour.Points.Add(startEdge.Start);
-                    contour.Points.Add(startEdge.End);
-
-                    Vector2 currentEnd = startEdge.End;
-
-                    bool foundNext = true;
-                    int guard = 0;
-
-                    while (foundNext && guard < 10000)
-                    {
-                        guard++;
-                        foundNext = false;
-
-                        for (int i = 0; i < remaining.Count; i++)
-                        {
-                            SwfShapeEdge edge = remaining[i];
-
-                            if (PointsClose(edge.Start, currentEnd))
-                            {
-                                contour.Points.Add(edge.End);
-                                currentEnd = edge.End;
-                                remaining.RemoveAt(i);
-                                foundNext = true;
-                                break;
-                            }
-
-                            if (PointsClose(edge.End, currentEnd))
-                            {
-                                contour.Points.Add(edge.Start);
-                                currentEnd = edge.Start;
-                                remaining.RemoveAt(i);
-                                foundNext = true;
-                                break;
-                            }
-                        }
-
-                        if (PointsClose(currentEnd, contour.Points[0]))
-                        {
-                            break;
-                        }
-                    }
-
-                    group.Contours.Add(contour);
-                }
-
+                StitchDirectedEdges(group);
                 MarkHoleCandidates(group);
             }
+        }
+
+        // Follows each fill group's edges strictly forward (Start -> End) to form
+        // closed loops. BuildFillEdgeGroups already orients every edge so the fill
+        // lies on a consistent side (FillStyle1 kept as-is, FillStyle0 reversed),
+        // so forward-only traversal preserves the winding: outer boundaries and
+        // holes come out with opposite orientation, exactly like Flash. The old
+        // code matched either endpoint, which flipped edges and scrambled shapes.
+        private void StitchDirectedEdges(SwfFillEdgeGroup group)
+        {
+            if (group == null || group.Edges == null || group.Edges.Count == 0)
+                return;
+
+            Dictionary<long, List<SwfShapeEdge>> byStartCell =
+                new Dictionary<long, List<SwfShapeEdge>>();
+
+            for (int i = 0; i < group.Edges.Count; i++)
+            {
+                SwfShapeEdge edge = group.Edges[i];
+                long key = PointCellKey(edge.Start);
+
+                if (!byStartCell.TryGetValue(key, out List<SwfShapeEdge> bucket))
+                {
+                    bucket = new List<SwfShapeEdge>();
+                    byStartCell[key] = bucket;
+                }
+
+                bucket.Add(edge);
+            }
+
+            HashSet<SwfShapeEdge> used = new HashSet<SwfShapeEdge>();
+
+            for (int i = 0; i < group.Edges.Count; i++)
+            {
+                SwfShapeEdge startEdge = group.Edges[i];
+
+                if (used.Contains(startEdge))
+                    continue;
+
+                SwfFillContour contour = new SwfFillContour
+                {
+                    FillStyleIndex = group.FillStyleIndex
+                };
+
+                SwfShapeEdge current = startEdge;
+                Vector2 loopStart = current.Start;
+                contour.Points.Add(current.Start);
+
+                int guard = 0;
+                int maxGuard = group.Edges.Count + 4;
+
+                while (current != null && guard++ < maxGuard)
+                {
+                    used.Add(current);
+                    contour.Points.Add(current.End);
+
+                    if (PointsClose(current.End, loopStart))
+                        break; // loop closed cleanly
+
+                    current = TakeNextForwardEdge(byStartCell, used, current.End);
+                }
+
+                if (contour.Points.Count >= 3)
+                    group.Contours.Add(contour);
+            }
+        }
+
+        private SwfShapeEdge TakeNextForwardEdge(
+            Dictionary<long, List<SwfShapeEdge>> byStartCell,
+            HashSet<SwfShapeEdge> used,
+            Vector2 tip
+        )
+        {
+            long baseX = (long)Mathf.Round(tip.x / PointCellSize);
+            long baseY = (long)Mathf.Round(tip.y / PointCellSize);
+
+            // Sub-tolerance rounding can drop a shared vertex into a neighbouring
+            // cell, so scan the 3x3 block around the tip, not just its own cell.
+            for (long oy = -1; oy <= 1; oy++)
+            {
+                for (long ox = -1; ox <= 1; ox++)
+                {
+                    long key = CellKey(baseX + ox, baseY + oy);
+
+                    if (!byStartCell.TryGetValue(key, out List<SwfShapeEdge> bucket))
+                        continue;
+
+                    for (int i = 0; i < bucket.Count; i++)
+                    {
+                        SwfShapeEdge candidate = bucket[i];
+
+                        if (!used.Contains(candidate) && PointsClose(candidate.Start, tip))
+                            return candidate;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        // Vertex-welding grid for edge stitching. Matches the PointsClose radius so
+        // two endpoints that count as "the same" always land within a 3x3 lookup.
+        private const float PointCellSize = 0.5f;
+
+        private static long PointCellKey(Vector2 p)
+        {
+            long qx = (long)Mathf.Round(p.x / PointCellSize);
+            long qy = (long)Mathf.Round(p.y / PointCellSize);
+            return CellKey(qx, qy);
+        }
+
+        private static long CellKey(long qx, long qy)
+        {
+            return (qx << 32) ^ (qy & 0xffffffffL);
         }
 
         private void MarkHoleCandidates(SwfFillEdgeGroup group)

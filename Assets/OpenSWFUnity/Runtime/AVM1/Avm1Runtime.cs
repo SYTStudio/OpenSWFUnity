@@ -8,7 +8,11 @@ namespace OpenSWFUnity.Runtime.AVM1
 {
     public sealed class Avm1Runtime
     {
-        private const int DefaultInstructionBudget = 200000;
+        // A real game's initialisation script legitimately runs far more than a
+        // demo's: 200k was low enough that Isaac-sized content tripped the guard
+        // during startup and silently stopped half-configured. Still bounded, so
+        // a genuinely runaway script cannot hang the Editor.
+        private const int DefaultInstructionBudget = 5000000;
         private static readonly object Undefined = new object();
 
         private readonly StringComparer nameComparer;

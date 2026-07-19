@@ -20,7 +20,7 @@ namespace OpenSWFUnity.Runtime
         }
 
         [Header("SWF File")]
-        public TextAsset swfFile;
+        public SwfAsset swfFile;
 
         [Tooltip("Shows the optional console-style library before starting the movie.")]
         public bool showLibraryOnStart = false;
@@ -54,7 +54,12 @@ namespace OpenSWFUnity.Runtime
         [Tooltip("Current root frame used for timeline debug.")]
         public int debugFrame = 0;
 
-        [Tooltip("Automatically advances debug frames in Play Mode.")]
+        // Runtime playback state, not a setting. A Flash movie's root timeline
+        // always starts playing; only the movie's own stop()/play() may change
+        // that. Exposing it in the Inspector let a saved scene value freeze the
+        // root at frame 1 and stall the whole movie, so it is hidden and always
+        // starts true.
+        [System.NonSerialized]
         public bool autoPlayTimeline = true;
 
         [Tooltip("Loops sprite timelines. Disable this to hold sprites on their final frame.")]
@@ -123,6 +128,11 @@ namespace OpenSWFUnity.Runtime
             new List<DynamicMovieClip>();
         private readonly Dictionary<Avm1Object, DynamicMovieClip> dynamicMovieClipsByObject =
             new Dictionary<Avm1Object, DynamicMovieClip>();
+        // Display lists are pure functions of (timeline, frame), so they are built
+        // once and reused instead of replaying control tags every rendered frame.
+        private readonly Dictionary<List<SwfFrame>, Dictionary<int, List<PlaceObject2Tag>>> displayListCache =
+            new Dictionary<List<SwfFrame>, Dictionary<int, List<PlaceObject2Tag>>>();
+
         private readonly Dictionary<string, StaticDisplayInstance> staticDisplayInstances =
             new Dictionary<string, StaticDisplayInstance>();
         private readonly Dictionary<Avm1Object, StaticDisplayInstance> staticDisplayInstancesByObject =
@@ -229,6 +239,11 @@ namespace OpenSWFUnity.Runtime
                     header.StageWidth,
                     header.StageHeight
                 );
+
+                // Lets bitmap fills resolve their character id to a decoded
+                // texture; textures are built on first use, not at parse time.
+                runtimeRasterRenderer.BitmapProvider = bitmapId =>
+                    parser.FindBitmapById(bitmapId)?.GetTexture();
                 runtimeTextRenderer = new SwfTextRenderer(
                     transform,
                     header.StageWidth,
@@ -484,6 +499,19 @@ namespace OpenSWFUnity.Runtime
                 SwfMatrix effectiveMatrix = instance != null
                     ? BuildDynamicMovieClipMatrix(instance.ScriptObject)
                     : placed.Matrix;
+
+                // Timeline-placed clips honour _visible exactly like dynamically
+                // created ones. Content routinely parks a pile of clips on frame 1
+                // and hides them from script; ignoring _visible here drew every one
+                // of them on top of the real scene.
+                if (instance != null &&
+                    !Avm1Boolean(instance.ScriptObject.Get("_visible"), true))
+                {
+                    continue;
+                }
+
+                if (placed.HasVisible && placed.Visible == 0)
+                    continue;
 
                 if (isSprite && instance != null)
                     childFrame = instance.CurrentFrame;
@@ -881,6 +909,18 @@ namespace OpenSWFUnity.Runtime
                 SwfMatrix localMatrix = childInstance != null
                     ? BuildDynamicMovieClipMatrix(childInstance.ScriptObject)
                     : innerPlace.Matrix;
+
+                // Children inside a sprite honour _visible too; hiding a parent
+                // clip must not leave its contents drawn.
+                if (childInstance != null &&
+                    !Avm1Boolean(childInstance.ScriptObject.Get("_visible"), true))
+                {
+                    continue;
+                }
+
+                if (innerPlace.HasVisible && innerPlace.Visible == 0)
+                    continue;
+
                 SwfMatrix combinedMatrix = SwfMatrix.Combine(parentMatrix, localMatrix);
 
                 int childFrame = usePlacedObjectLocalAge
@@ -1525,6 +1565,7 @@ namespace OpenSWFUnity.Runtime
             dynamicMovieClipsByObject.Clear();
             staticDisplayInstances.Clear();
             staticDisplayInstancesByObject.Clear();
+            displayListCache.Clear();
 
             if (!enableAvm1 || parser == null)
                 return;
@@ -2470,7 +2511,7 @@ namespace OpenSWFUnity.Runtime
                     string instanceName = ArgumentString(arguments, 1);
                     int depth = ArgumentInt(arguments, 2, GetNextDynamicDepth(receiver));
                     Avm1Object initObject = arguments.Count > 3 ? arguments[3] as Avm1Object : null;
-                    return CreateDynamicMovieClip(
+                    Avm1Object attached = CreateDynamicMovieClip(
                         receiver as Avm1Object,
                         linkage,
                         0,
@@ -2479,6 +2520,27 @@ namespace OpenSWFUnity.Runtime
                         initObject,
                         false
                     );
+
+                    // A silently failing attachMovie looks identical on screen to
+                    // a rendering bug, so say which one it is.
+                    if (attached == null)
+                    {
+                        Debug.LogWarning(
+                            "attachMovie('" + linkage + "') failed: no exported asset with that " +
+                            "linkage name. Exported names: " +
+                            string.Join(", ", runtimeParser.ExportedAssets.Keys)
+                        );
+                    }
+                    else if (verboseLogging)
+                    {
+                        Debug.Log(
+                            "attachMovie('" + linkage + "') -> depth " + depth +
+                            " parentIsRoot=" + (receiver == runtimeAvm1.RootObject) +
+                            " totalDynamicClips=" + dynamicMovieClips.Count
+                        );
+                    }
+
+                    return attached;
                 }
 
                 case "createemptymovieclip":
@@ -2541,9 +2603,12 @@ namespace OpenSWFUnity.Runtime
 
                 case "random":
                 {
-                    int maximum = arguments.Count > 0
-                        ? Mathf.Max(0, Mathf.RoundToInt(System.Convert.ToSingle(arguments[0])))
-                        : 0;
+                    // AVM1 coerces the argument to a number rather than failing on
+                    // it: random(undefined) is 0 in Flash, not an exception. A raw
+                    // Convert.ToSingle threw InvalidCastException on undefined and
+                    // object arguments, which a game calling random() in a loop
+                    // turns into thousands of errors and a stalled script.
+                    int maximum = Mathf.Max(0, ArgumentInt(arguments, 0, 0));
                     return maximum > 0 ? UnityEngine.Random.Range(0, maximum) : 0;
                 }
 
@@ -2647,6 +2712,20 @@ namespace OpenSWFUnity.Runtime
                 return new List<PlaceObject2Tag>();
 
             int maxFrame = Mathf.Clamp(frameIndex, 0, frames.Count - 1);
+
+            // Building a display list replays every control tag from frame 1 up to
+            // this frame, re-parsing each one straight out of the SWF byte buffer.
+            // That runs once per sprite per rendered frame, so on content with
+            // thousands of sprites it dominates the frame time even though the
+            // result only depends on (timeline, frame) and never changes. Cache it.
+            if (!displayListCache.TryGetValue(frames, out Dictionary<int, List<PlaceObject2Tag>> framesCache))
+            {
+                framesCache = new Dictionary<int, List<PlaceObject2Tag>>();
+                displayListCache[frames] = framesCache;
+            }
+
+            if (framesCache.TryGetValue(maxFrame, out List<PlaceObject2Tag> cached))
+                return cached;
 
             for (int f = 0; f <= maxFrame; f++)
             {
@@ -2780,6 +2859,7 @@ namespace OpenSWFUnity.Runtime
 
             result.Sort((a, b) => a.Depth.CompareTo(b.Depth));
 
+            framesCache[maxFrame] = result;
             return result;
         }
 

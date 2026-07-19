@@ -5,43 +5,59 @@ using OpenSWFUnity.Runtime.Tags;
 
 namespace OpenSWFUnity.Runtime.Renderer
 {
+    // Batched vector fill renderer.
+    //
+    // Shapes are triangulated once into local space (cached per shape+group),
+    // then every fill drawn this frame is appended into shared vertex/index/
+    // colour buffers. Buffers are flushed into a real Mesh only when the stencil
+    // state changes or the frame ends, so a scene with thousands of shapes costs
+    // a handful of draws instead of one GameObject per fill per frame - that
+    // GameObject churn is what made a full game freeze the Editor.
     public class SwfRasterFillRenderer
     {
         private readonly Transform poolRoot;
         private readonly float stageWidth;
         private readonly float stageHeight;
-        private readonly List<RasterInstance> instances = new List<RasterInstance>();
 
         private static Material sharedMaterial;
         private static readonly Dictionary<int, Material> stencilMaterials =
             new Dictionary<int, Material>();
         private static readonly int MainTextureId = Shader.PropertyToID("_MainTex");
-        private static readonly int ColorId = Shader.PropertyToID("_Color");
         private static readonly int StencilRefId = Shader.PropertyToID("_StencilRef");
         private static readonly int StencilCompId = Shader.PropertyToID("_StencilComp");
         private static readonly int StencilPassId = Shader.PropertyToID("_StencilPass");
         private static readonly int ColorMaskId = Shader.PropertyToID("_ColorMask");
 
-        private int usedInstanceCount;
-        private int drawOrder;
-        private float activeRasterScale;
+        private static readonly Dictionary<string, LocalMeshData> meshCache =
+            new Dictionary<string, LocalMeshData>();
+
+        // A single Unity mesh cannot exceed 65535 vertices with a 16-bit index
+        // buffer; flush before crossing it rather than losing geometry.
+        private const int MaxBatchVertices = 60000;
+        private const float PixelsPerUnit = 50f;
+        private const float TwipsPerPixel = 20f;
+
+        private readonly List<Vector3> batchVertices = new List<Vector3>(8192);
+        private readonly List<int> batchTriangles = new List<int>(16384);
+        private readonly List<Color32> batchColors = new List<Color32>(8192);
+        private readonly List<Vector2> batchUvs = new List<Vector2>(8192);
+
+        private readonly List<BatchInstance> batches = new List<BatchInstance>();
+        private int usedBatchCount;
+
+        // Geometry batches only as long as it shares a texture, so the active
+        // texture is part of the batch key alongside the stencil state.
+        private Texture batchTexture;
+        private static Texture2D whitePixel;
+
         private int stencilMode;
         private int stencilReference;
         private readonly Stack<int> stencilStateStack = new Stack<int>();
-
-        private static readonly Dictionary<string, Texture2D> rasterTextureCache = new Dictionary<string, Texture2D>();
-
-        private const float PixelsPerUnit = 50f;
-
-        // Higher value = sharper texture, but slower generation.
-        public static float RasterScale = 2f;
 
         public SwfRasterFillRenderer(Transform root, float stageWidth = 600f, float stageHeight = 400f)
         {
             this.stageWidth = stageWidth;
             this.stageHeight = stageHeight;
-            RasterScale = GetRasterScale();
-            activeRasterScale = RasterScale;
 
             Transform existingPool = root.Find("__SWF_RasterPool");
 
@@ -61,24 +77,29 @@ namespace OpenSWFUnity.Runtime.Renderer
 
         public void BeginFrame()
         {
-            float requestedScale = GetRasterScale();
-
-            if (!Mathf.Approximately(activeRasterScale, requestedScale))
-            {
-                ClearTextureCache();
-                activeRasterScale = requestedScale;
-            }
-
-            RasterScale = requestedScale;
-            usedInstanceCount = 0;
-            drawOrder = 0;
+            ClearBatchBuffers();
+            usedBatchCount = 0;
             stencilMode = 0;
             stencilReference = 0;
             stencilStateStack.Clear();
         }
 
+        public void EndFrame()
+        {
+            FlushBatch();
+
+            for (int i = usedBatchCount; i < batches.Count; i++)
+            {
+                if (batches[i].GameObject.activeSelf)
+                    batches[i].GameObject.SetActive(false);
+            }
+        }
+
+        // Stencil state is baked into the material, so a change forces the
+        // current geometry out as its own draw before the new state begins.
         public void BeginMaskWrite(int reference)
         {
+            FlushBatch();
             stencilStateStack.Push((stencilMode << 8) | stencilReference);
             stencilMode = 1;
             stencilReference = Mathf.Clamp(reference, 1, 255);
@@ -86,12 +107,15 @@ namespace OpenSWFUnity.Runtime.Renderer
 
         public void BeginMaskedContent(int reference)
         {
+            FlushBatch();
             stencilMode = 2;
             stencilReference = Mathf.Clamp(reference, 1, 255);
         }
 
         public void EndStencil()
         {
+            FlushBatch();
+
             if (stencilStateStack.Count > 0)
             {
                 int state = stencilStateStack.Pop();
@@ -105,134 +129,235 @@ namespace OpenSWFUnity.Runtime.Renderer
             }
         }
 
-        private static void ClearTextureCache()
-        {
-            foreach (Texture2D texture in rasterTextureCache.Values)
-            {
-                if (texture != null)
-                    Object.Destroy(texture);
-            }
-
-            rasterTextureCache.Clear();
-        }
-
-        public void EndFrame()
-        {
-            for (int i = usedInstanceCount; i < instances.Count; i++)
-            {
-                if (instances[i].GameObject.activeSelf)
-                    instances[i].GameObject.SetActive(false);
-            }
-        }
-
-        private float GetRasterScale()
-        {
-            if (SwfPlayer.Instance != null)
-            {
-                float qualityScale = (float)SwfPlayer.Instance.renderQuality;
-                return qualityScale;
-            }
-
-            return 4f;
-        }
-
         public void DrawShapeRasterFill(DefineShapeTag shape, SwfMatrix matrix, string name, float alpha)
         {
             if (shape == null || shape.ShapeData == null || shape.ShapeData.FillEdgeGroups == null)
                 return;
 
-            List<int> groupOrder = new List<int>();
+            if (alpha <= 0.004f)
+                return;
 
-            for (int i = 0; i < shape.ShapeData.FillEdgeGroups.Count; i++)
+            List<SwfFillEdgeGroup> groups = shape.ShapeData.FillEdgeGroups;
+
+            // Higher fill style indices are detail/shadow layers that belong
+            // behind the primary fill, so emit them first (painter's order).
+            for (int pass = 0; pass < 2; pass++)
             {
-                groupOrder.Add(i);
-            }
-
-            // Draw secondary/details first, primary fill last.
-            // This makes shadows/details go behind the main fill instead of covering it.
-            groupOrder.Sort((a, b) =>
-            {
-                SwfFillEdgeGroup ga = shape.ShapeData.FillEdgeGroups[a];
-                SwfFillEdgeGroup gb = shape.ShapeData.FillEdgeGroups[b];
-
-                int fa = ga != null ? ga.FillStyleIndex : 0;
-                int fb = gb != null ? gb.FillStyleIndex : 0;
-
-                // Higher fill style index first, FillStyle 1 last.
-                int fillCompare = fb.CompareTo(fa);
-
-                if (fillCompare != 0)
-                    return fillCompare;
-
-                return a.CompareTo(b);
-            });
-
-            for (int orderIndex = 0; orderIndex < groupOrder.Count; orderIndex++)
-            {
-                int g = groupOrder[orderIndex];
-
-                SwfFillEdgeGroup group = shape.ShapeData.FillEdgeGroups[g];
-
-                if (group == null || group.Contours == null || group.Contours.Count == 0)
-                    continue;
-
-                Color fillColor = GetFillColor(shape, group.FillStyleIndex);
-
-                if (fillColor.a <= 0.01f || alpha <= 0.01f)
-                    continue;
-
-                Color textureColor = fillColor;
-                textureColor.a = 1f;
-
-                Rect bounds = GetGroupBounds(group);
-
-                if (bounds.width <= 0.01f || bounds.height <= 0.01f)
-                    continue;
-
-                bounds = ExpandRect(bounds, 1.5f);
-
-                string cacheKey =
-                    shape.CharacterId +
-                    "_group_" + g +
-                    "_scale_" + RasterScale +
-                    "_rgb_" + textureColor.r + "_" + textureColor.g + "_" + textureColor.b;
-
-                if (!rasterTextureCache.TryGetValue(cacheKey, out Texture2D texture) || texture == null)
+                for (int g = 0; g < groups.Count; g++)
                 {
-                    texture = BuildRasterTexture(group, bounds, textureColor);
-                    rasterTextureCache[cacheKey] = texture;
+                    SwfFillEdgeGroup group = groups[g];
+
+                    if (group == null || group.Contours == null || group.Contours.Count == 0)
+                        continue;
+
+                    bool isPrimary = group.FillStyleIndex <= 1;
+
+                    if ((pass == 0) == isPrimary)
+                        continue;
+
+                    SwfFillStyle style = GetFillStyle(shape, group.FillStyleIndex);
+
+                    if (style == null)
+                        continue;
+
+                    Color fillColor = style.ToUnityColor();
+                    Texture texture = ResolveBitmapTexture(style);
+
+                    if (style.IsBitmap)
+                    {
+                        // A bitmap fill whose character cannot be resolved draws
+                        // nothing in Flash. Content commonly carries fills bound to
+                        // id 65535 (the "no bitmap" sentinel); painting those as an
+                        // opaque quad covered the whole stage.
+                        if (texture == null)
+                            continue;
+
+                        // Colour comes from the texture, so the vertex colour stays
+                        // neutral and only carries alpha.
+                        fillColor = Color.white;
+                    }
+                    else if (fillColor.a <= 0.004f)
+                    {
+                        continue;
+                    }
+
+                    fillColor.a *= alpha;
+                    AppendFill(shape, g, group, matrix, fillColor, style, texture);
                 }
-
-                if (texture == null)
-                    continue;
-
-                RasterInstance instance = AcquireInstance(name + "_RasterFill_Group_" + g);
-                instance.Renderer.sortingOrder = drawOrder++;
-                instance.Renderer.sharedMaterial = GetActiveMaterial();
-
-                Color materialColor = new Color(1f, 1f, 1f, alpha);
-                instance.PropertyBlock.Clear();
-                instance.PropertyBlock.SetTexture(MainTextureId, texture);
-                instance.PropertyBlock.SetColor(ColorId, materialColor);
-                instance.Renderer.SetPropertyBlock(instance.PropertyBlock);
-
-                UpdateTexturedQuad(instance, bounds, matrix);
             }
+        }
+
+        private Texture ResolveBitmapTexture(SwfFillStyle style)
+        {
+            if (style == null || !style.IsBitmap || BitmapProvider == null)
+                return null;
+
+            return BitmapProvider(style.BitmapId);
+        }
+
+        // Set by SwfPlayer so the renderer can resolve a fill's bitmap id into a
+        // decoded texture without taking a hard dependency on the parser.
+        public System.Func<ushort, Texture> BitmapProvider { get; set; }
+
+        private void AppendFill(
+            DefineShapeTag shape,
+            int groupIndex,
+            SwfFillEdgeGroup group,
+            SwfMatrix matrix,
+            Color color,
+            SwfFillStyle style,
+            Texture texture
+        )
+        {
+            string cacheKey = shape.CharacterId + "_" + groupIndex;
+
+            if (!meshCache.TryGetValue(cacheKey, out LocalMeshData meshData))
+            {
+                meshData = BuildLocalMesh(group);
+                meshCache[cacheKey] = meshData;
+            }
+
+            if (meshData == null || meshData.Triangles.Length == 0)
+                return;
+
+            Texture wanted = texture != null ? texture : whitePixel;
+
+            if (batchTexture != null && wanted != batchTexture)
+                FlushBatch();
+
+            if (batchVertices.Count + meshData.Vertices.Length > MaxBatchVertices)
+                FlushBatch();
+
+            batchTexture = wanted;
+
+            // For bitmap fills the stored matrix maps texture space into shape
+            // space, so the inverse turns each shape-space vertex back into a
+            // texel coordinate, then into a normalised UV.
+            bool textured = texture != null;
+            SwfMatrix inverseFill = SwfMatrix.Identity;
+            float texelWidth = 1f;
+            float texelHeight = 1f;
+
+            if (textured)
+            {
+                if (!style.BitmapMatrix.TryInvert(out inverseFill))
+                    textured = false;
+
+                texelWidth = Mathf.Max(1, texture.width);
+                texelHeight = Mathf.Max(1, texture.height);
+            }
+
+            int baseIndex = batchVertices.Count;
+            Color32 packed = color;
+
+            for (int i = 0; i < meshData.Vertices.Length; i++)
+            {
+                Vector2 local = meshData.Vertices[i];
+                Vector3 world = FlashToUnityPoint(local.x, local.y, matrix);
+
+                if (!IsFinite(world))
+                    return; // degenerate transform; skip this fill entirely
+
+                batchVertices.Add(world);
+                batchColors.Add(packed);
+
+                if (textured)
+                {
+                    // The inverse runs in the parser's mixed units: shape points are
+                    // pixels and the matrix translate is pixels, but its scale still
+                    // maps the bitmap's own texel units into twips. That leaves the
+                    // result 20x short of a texel coordinate, which magnified every
+                    // texture by 20x on screen.
+                    Vector2 texel = inverseFill.TransformPoint(local) * TwipsPerPixel;
+                    batchUvs.Add(new Vector2(texel.x / texelWidth, 1f - texel.y / texelHeight));
+                }
+                else
+                {
+                    batchUvs.Add(Vector2.zero);
+                }
+            }
+
+            for (int i = 0; i < meshData.Triangles.Length; i++)
+                batchTriangles.Add(baseIndex + meshData.Triangles[i]);
+        }
+
+        private void FlushBatch()
+        {
+            if (batchTriangles.Count == 0)
+            {
+                ClearBatchBuffers();
+                return;
+            }
+
+            BatchInstance batch = AcquireBatch();
+            Mesh mesh = batch.Mesh;
+
+            mesh.Clear();
+            mesh.SetVertices(batchVertices);
+            mesh.SetColors(batchColors);
+            mesh.SetUVs(0, batchUvs);
+            mesh.SetTriangles(batchTriangles, 0, false);
+            mesh.RecalculateBounds();
+
+            batch.Renderer.sharedMaterial = GetActiveMaterial();
+            batch.Renderer.sortingOrder = usedBatchCount;
+
+            batch.PropertyBlock.Clear();
+            batch.PropertyBlock.SetTexture(MainTextureId, batchTexture != null ? batchTexture : whitePixel);
+            batch.Renderer.SetPropertyBlock(batch.PropertyBlock);
+
+            ClearBatchBuffers();
+        }
+
+        private void ClearBatchBuffers()
+        {
+            batchVertices.Clear();
+            batchTriangles.Clear();
+            batchColors.Clear();
+            batchUvs.Clear();
+            batchTexture = null;
+        }
+
+        private static LocalMeshData BuildLocalMesh(SwfFillEdgeGroup group)
+        {
+            List<Vector2> vertices = new List<Vector2>();
+            List<int> triangles = new List<int>();
+
+            SwfPolygonTriangulator.Triangulate(group.Contours, vertices, triangles);
+
+            return new LocalMeshData
+            {
+                Vertices = vertices.ToArray(),
+                Triangles = triangles.ToArray()
+            };
         }
 
         private static void EnsureSharedMaterial()
         {
+            if (whitePixel == null)
+            {
+                // Solid fills sample this so one shader serves both solid and
+                // bitmap fills without a branch or a second material.
+                whitePixel = new Texture2D(1, 1, TextureFormat.RGBA32, false)
+                {
+                    name = "OpenSWF White Pixel",
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                whitePixel.SetPixel(0, 0, Color.white);
+                whitePixel.Apply(false, true);
+            }
+
             if (sharedMaterial != null)
                 return;
 
-            Shader shader = Shader.Find("OpenSWFUnity/SWF Raster Stencil");
+            Shader shader = Shader.Find("OpenSWFUnity/SWF Vector Batched");
 
             if (shader == null)
                 shader = Shader.Find("Sprites/Default");
 
             sharedMaterial = new Material(shader)
             {
-                name = "OpenSWF Shared Raster Material",
+                name = "OpenSWF Batched Vector Material",
                 hideFlags = HideFlags.HideAndDontSave
             };
 
@@ -273,33 +398,21 @@ namespace OpenSWFUnity.Runtime.Renderer
             return material;
         }
 
-        private RasterInstance AcquireInstance(string instanceName)
+        private BatchInstance AcquireBatch()
         {
-            RasterInstance instance;
+            BatchInstance batch;
 
-            if (usedInstanceCount < instances.Count)
+            if (usedBatchCount < batches.Count)
             {
-                instance = instances[usedInstanceCount];
+                batch = batches[usedBatchCount];
             }
             else
             {
-                GameObject go = new GameObject(instanceName);
+                GameObject go = new GameObject("__SWF_Batch_" + usedBatchCount);
                 go.transform.SetParent(poolRoot, false);
 
-                Mesh mesh = new Mesh
-                {
-                    name = "SWF Raster Fill Quad"
-                };
+                Mesh mesh = new Mesh { name = "SWF Batched Vector Mesh" };
                 mesh.MarkDynamic();
-                mesh.vertices = new Vector3[4];
-                mesh.uv = new[]
-                {
-                    new Vector2(0f, 0f),
-                    new Vector2(1f, 0f),
-                    new Vector2(1f, 1f),
-                    new Vector2(0f, 1f)
-                };
-                mesh.triangles = new[] { 0, 1, 2, 0, 2, 3 };
 
                 MeshFilter meshFilter = go.AddComponent<MeshFilter>();
                 MeshRenderer meshRenderer = go.AddComponent<MeshRenderer>();
@@ -307,300 +420,23 @@ namespace OpenSWFUnity.Runtime.Renderer
                 meshRenderer.sharedMaterial = sharedMaterial;
                 meshRenderer.sortingLayerName = "Default";
 
-                instance = new RasterInstance
+                batch = new BatchInstance
                 {
                     GameObject = go,
                     Mesh = mesh,
                     Renderer = meshRenderer,
-                    PropertyBlock = new MaterialPropertyBlock(),
-                    Vertices = new Vector3[4]
+                    PropertyBlock = new MaterialPropertyBlock()
                 };
 
-                instances.Add(instance);
+                batches.Add(batch);
             }
 
-            usedInstanceCount++;
-            instance.GameObject.name = instanceName;
+            usedBatchCount++;
 
-            if (!instance.GameObject.activeSelf)
-                instance.GameObject.SetActive(true);
+            if (!batch.GameObject.activeSelf)
+                batch.GameObject.SetActive(true);
 
-            return instance;
-        }
-
-        private Rect ExpandRect(Rect rect, float amount)
-        {
-            return Rect.MinMaxRect(
-                rect.xMin - amount,
-                rect.yMin - amount,
-                rect.xMax + amount,
-                rect.yMax + amount
-            );
-        }
-
-        private Texture2D BuildRasterTexture(SwfFillEdgeGroup group, Rect bounds, Color fillColor)
-        {
-            bool useEvenOdd = HasRealHoles(group);
-
-            int width = Mathf.Clamp(Mathf.CeilToInt(bounds.width * RasterScale), 1, 2048);
-            int height = Mathf.Clamp(Mathf.CeilToInt(bounds.height * RasterScale), 1, 2048);
-
-            Texture2D texture = new Texture2D(width, height, TextureFormat.RGBA32, false);
-            texture.wrapMode = TextureWrapMode.Clamp;
-            texture.filterMode = FilterMode.Bilinear;
-
-            Color32 fill = fillColor;
-            Color32[] pixels = new Color32[width * height];
-
-            if (useEvenOdd)
-            {
-                RasterizeEvenOdd(group.Contours, bounds, width, height, pixels, fill);
-            }
-            else
-            {
-                RasterizeContourUnion(group.Contours, bounds, width, height, pixels, fill);
-            }
-
-            texture.SetPixels32(pixels);
-            texture.Apply(false, true);
-
-            return texture;
-        }
-
-        private void RasterizeEvenOdd(
-            List<SwfFillContour> contours,
-            Rect bounds,
-            int width,
-            int height,
-            Color32[] pixels,
-            Color32 fill
-        )
-        {
-            List<float> intersections = new List<float>(64);
-
-            for (int y = 0; y < height; y++)
-            {
-                float flashY = bounds.yMax - (y + 0.5f) / RasterScale;
-                intersections.Clear();
-
-                for (int c = 0; c < contours.Count; c++)
-                {
-                    SwfFillContour contour = contours[c];
-
-                    if (contour == null || !contour.IsClosed)
-                        continue;
-
-                    AddScanlineIntersections(contour, flashY, intersections);
-                }
-
-                FillIntersectionPairs(intersections, bounds, width, y, pixels, fill);
-            }
-        }
-
-        private void RasterizeContourUnion(
-            List<SwfFillContour> contours,
-            Rect bounds,
-            int width,
-            int height,
-            Color32[] pixels,
-            Color32 fill
-        )
-        {
-            List<float> intersections = new List<float>(64);
-
-            for (int y = 0; y < height; y++)
-            {
-                float flashY = bounds.yMax - (y + 0.5f) / RasterScale;
-
-                for (int c = 0; c < contours.Count; c++)
-                {
-                    SwfFillContour contour = contours[c];
-
-                    if (contour == null)
-                        continue;
-
-                    intersections.Clear();
-                    AddScanlineIntersections(contour, flashY, intersections);
-                    FillIntersectionPairs(intersections, bounds, width, y, pixels, fill);
-                }
-            }
-        }
-
-        private void AddScanlineIntersections(
-            SwfFillContour contour,
-            float y,
-            List<float> intersections
-        )
-        {
-            List<Vector2> points = contour.Points;
-
-            if (points == null || points.Count < 3)
-                return;
-
-            int edgeCount = contour.IsClosed ? points.Count : points.Count - 1;
-
-            for (int i = 0; i < edgeCount; i++)
-            {
-                Vector2 a = points[i];
-                Vector2 b = points[(i + 1) % points.Count];
-
-                if (Mathf.Abs(a.y - b.y) < 0.0001f)
-                    continue;
-
-                float minY = Mathf.Min(a.y, b.y);
-                float maxY = Mathf.Max(a.y, b.y);
-
-                if (y < minY || y >= maxY)
-                    continue;
-
-                float t = (y - a.y) / (b.y - a.y);
-                intersections.Add(a.x + t * (b.x - a.x));
-            }
-        }
-
-        private void FillIntersectionPairs(
-            List<float> intersections,
-            Rect bounds,
-            int width,
-            int y,
-            Color32[] pixels,
-            Color32 fill
-        )
-        {
-            if (intersections.Count < 2)
-                return;
-
-            intersections.Sort();
-
-            for (int i = 0; i + 1 < intersections.Count; i += 2)
-            {
-                float left = intersections[i];
-                float right = intersections[i + 1];
-                int startX = Mathf.CeilToInt((left - bounds.xMin) * RasterScale - 0.5f);
-                int endX = Mathf.FloorToInt((right - bounds.xMin) * RasterScale - 0.5f);
-
-                startX = Mathf.Clamp(startX, 0, width - 1);
-                endX = Mathf.Clamp(endX, 0, width - 1);
-
-                int rowOffset = y * width;
-
-                for (int x = startX; x <= endX; x++)
-                    pixels[rowOffset + x] = fill;
-            }
-        }
-
-        private bool IsInsideByContourScanlineAllowOpen(Vector2 point, SwfFillEdgeGroup group)
-        {
-            if (group == null || group.Contours == null || group.Contours.Count == 0)
-                return false;
-
-            for (int c = 0; c < group.Contours.Count; c++)
-            {
-                SwfFillContour contour = group.Contours[c];
-
-                if (contour == null || contour.Points == null || contour.Points.Count < 3)
-                    continue;
-
-                if (IsInsideSingleContourScanline(point, contour))
-                    return true;
-            }
-
-            return false;
-        }
-
-        private bool IsInsideSingleContourScanline(Vector2 point, SwfFillContour contour)
-        {
-            List<Vector2> points = contour.Points;
-
-            if (points == null || points.Count < 3)
-                return false;
-
-            List<float> intersections = new List<float>();
-            float y = point.y;
-
-            // Closed contours use last -> first.
-            // Open contours use only real consecutive edges.
-            int edgeCount = contour.IsClosed ? points.Count : points.Count - 1;
-
-            for (int i = 0; i < edgeCount; i++)
-            {
-                Vector2 a = points[i];
-                Vector2 b = points[(i + 1) % points.Count];
-
-                if (Mathf.Abs(a.y - b.y) < 0.0001f)
-                    continue;
-
-                float minY = Mathf.Min(a.y, b.y);
-                float maxY = Mathf.Max(a.y, b.y);
-
-                // Half-open interval avoids double-counting vertices.
-                if (y < minY || y >= maxY)
-                    continue;
-
-                float t = (y - a.y) / (b.y - a.y);
-                float x = a.x + t * (b.x - a.x);
-
-                intersections.Add(x);
-            }
-
-            if (intersections.Count < 2)
-                return false;
-
-            intersections.Sort();
-
-            for (int i = 0; i < intersections.Count - 1; i += 2)
-            {
-                float x0 = intersections[i];
-                float x1 = intersections[i + 1];
-
-                if (point.x >= x0 && point.x <= x1)
-                    return true;
-            }
-
-            return false;
-        }
-
-        private bool IsInsideEvenOddClosedContours(Vector2 point, List<SwfFillContour> contours)
-        {
-            int crossings = 0;
-
-            for (int i = 0; i < contours.Count; i++)
-            {
-                SwfFillContour contour = contours[i];
-
-                if (contour == null || contour.Points == null || contour.Points.Count < 3)
-                    continue;
-
-                if (!contour.IsClosed)
-                    continue;
-
-                if (PointInPolygon(point, contour.Points))
-                {
-                    crossings++;
-                }
-            }
-
-            return (crossings % 2) == 1;
-        }
-
-        private void UpdateTexturedQuad(RasterInstance instance, Rect bounds, SwfMatrix matrix)
-        {
-            instance.Vertices[0] = FlashToUnityPoint(bounds.xMin, bounds.yMax, matrix);
-            instance.Vertices[1] = FlashToUnityPoint(bounds.xMax, bounds.yMax, matrix);
-            instance.Vertices[2] = FlashToUnityPoint(bounds.xMax, bounds.yMin, matrix);
-            instance.Vertices[3] = FlashToUnityPoint(bounds.xMin, bounds.yMin, matrix);
-
-            for (int i = 0; i < instance.Vertices.Length; i++)
-            {
-                if (!IsFinite(instance.Vertices[i]))
-                {
-                    instance.GameObject.SetActive(false);
-                    return;
-                }
-            }
-
-            instance.Mesh.vertices = instance.Vertices;
-            instance.Mesh.RecalculateBounds();
+            return batch;
         }
 
         private static bool IsFinite(Vector3 value)
@@ -611,157 +447,17 @@ namespace OpenSWFUnity.Runtime.Renderer
                 !float.IsNaN(value.z) && !float.IsInfinity(value.z);
         }
 
-        private bool IsInsideByContourScanline(Vector2 point, SwfFillEdgeGroup group)
-        {
-            if (group == null || group.Contours == null || group.Contours.Count == 0)
-                return false;
-
-            List<float> intersections = new List<float>();
-            float y = point.y;
-
-            for (int c = 0; c < group.Contours.Count; c++)
-            {
-                SwfFillContour contour = group.Contours[c];
-
-                if (contour == null || contour.Points == null || contour.Points.Count < 3)
-                    continue;
-
-                if (!contour.IsClosed)
-                    continue;
-
-                List<Vector2> points = contour.Points;
-
-                for (int i = 0; i < points.Count; i++)
-                {
-                    Vector2 a = points[i];
-                    Vector2 b = points[(i + 1) % points.Count];
-
-                    if (Mathf.Abs(a.y - b.y) < 0.0001f)
-                        continue;
-
-                    float minY = Mathf.Min(a.y, b.y);
-                    float maxY = Mathf.Max(a.y, b.y);
-
-                    if (y < minY || y >= maxY)
-                        continue;
-
-                    float t = (y - a.y) / (b.y - a.y);
-                    float x = a.x + t * (b.x - a.x);
-
-                    intersections.Add(x);
-                }
-            }
-
-            if (intersections.Count < 2)
-                return false;
-
-            intersections.Sort();
-
-            for (int i = 0; i < intersections.Count - 1; i += 2)
-            {
-                float x0 = intersections[i];
-                float x1 = intersections[i + 1];
-
-                if (point.x >= x0 && point.x <= x1)
-                    return true;
-            }
-
-            return false;
-        }
-
-        private bool IsInsideEvenOdd(Vector2 point, List<SwfFillContour> contours)
-        {
-            int crossings = 0;
-
-            for (int i = 0; i < contours.Count; i++)
-            {
-                SwfFillContour contour = contours[i];
-
-                if (contour == null || contour.Points == null || contour.Points.Count < 3)
-                    continue;
-
-                if (PointInPolygon(point, contour.Points))
-                {
-                    crossings++;
-                }
-            }
-
-            return (crossings % 2) == 1;
-        }
-
-        private bool PointInPolygon(Vector2 point, List<Vector2> polygon)
-        {
-            bool inside = false;
-
-            for (int i = 0, j = polygon.Count - 1; i < polygon.Count; j = i++)
-            {
-                Vector2 pi = polygon[i];
-                Vector2 pj = polygon[j];
-
-                bool intersects =
-                    ((pi.y > point.y) != (pj.y > point.y)) &&
-                    (point.x < (pj.x - pi.x) * (point.y - pi.y) / ((pj.y - pi.y) + 0.00001f) + pi.x);
-
-                if (intersects)
-                    inside = !inside;
-            }
-
-            return inside;
-        }
-
-        private Rect GetGroupBounds(SwfFillEdgeGroup group)
-        {
-            bool hasPoint = false;
-
-            float minX = 0f;
-            float minY = 0f;
-            float maxX = 0f;
-            float maxY = 0f;
-
-            for (int c = 0; c < group.Contours.Count; c++)
-            {
-                SwfFillContour contour = group.Contours[c];
-
-                if (contour == null || contour.Points == null)
-                    continue;
-
-                for (int p = 0; p < contour.Points.Count; p++)
-                {
-                    Vector2 point = contour.Points[p];
-
-                    if (!hasPoint)
-                    {
-                        minX = maxX = point.x;
-                        minY = maxY = point.y;
-                        hasPoint = true;
-                    }
-                    else
-                    {
-                        minX = Mathf.Min(minX, point.x);
-                        minY = Mathf.Min(minY, point.y);
-                        maxX = Mathf.Max(maxX, point.x);
-                        maxY = Mathf.Max(maxY, point.y);
-                    }
-                }
-            }
-
-            if (!hasPoint)
-                return new Rect();
-
-            return Rect.MinMaxRect(minX, minY, maxX, maxY);
-        }
-
-        private Color GetFillColor(DefineShapeTag shape, int fillStyleIndex)
+        private SwfFillStyle GetFillStyle(DefineShapeTag shape, int fillStyleIndex)
         {
             if (shape == null || shape.ShapeData == null || shape.ShapeData.FillStyles == null)
-                return Color.clear;
+                return null;
 
             int listIndex = fillStyleIndex - 1;
 
             if (listIndex < 0 || listIndex >= shape.ShapeData.FillStyles.Count)
-                return Color.clear;
+                return null;
 
-            return shape.ShapeData.FillStyles[listIndex].ToUnityColor();
+            return shape.ShapeData.FillStyles[listIndex];
         }
 
         private Vector3 FlashToUnityPoint(float x, float y, SwfMatrix matrix)
@@ -778,204 +474,18 @@ namespace OpenSWFUnity.Runtime.Renderer
             );
         }
 
-        private bool HasRealHoles(SwfFillEdgeGroup group)
+        private sealed class LocalMeshData
         {
-            if (group == null || group.Contours == null || group.Contours.Count < 2)
-                return false;
-
-            SwfFillContour mainContour = GetLargestContour(group);
-
-            if (mainContour == null)
-                return false;
-
-            for (int i = 0; i < group.Contours.Count; i++)
-            {
-                SwfFillContour contour = group.Contours[i];
-
-                if (contour == null || contour == mainContour)
-                    continue;
-
-                if (contour.Points == null || contour.Points.Count < 3)
-                    continue;
-
-                Vector2 center = GetContourCenter(contour);
-
-                bool insideMain = PointInPolygon(center, mainContour.Points);
-                bool smaller = Mathf.Abs(contour.Area) < Mathf.Abs(mainContour.Area);
-
-                if (insideMain && smaller && contour.IsClosed)
-                    return true;
-            }
-
-            return false;
+            public Vector2[] Vertices;
+            public int[] Triangles;
         }
 
-        private SwfFillContour GetLargestContour(SwfFillEdgeGroup group)
-        {
-            if (group == null || group.Contours == null || group.Contours.Count == 0)
-                return null;
-
-            SwfFillContour best = null;
-            float bestArea = 0f;
-
-            for (int i = 0; i < group.Contours.Count; i++)
-            {
-                SwfFillContour contour = group.Contours[i];
-
-                if (contour == null || contour.Points == null || contour.Points.Count < 3)
-                    continue;
-
-                float area = Mathf.Abs(contour.Area);
-
-                if (best == null || area > bestArea)
-                {
-                    best = contour;
-                    bestArea = area;
-                }
-            }
-
-            return best;
-        }
-
-        private Vector2 GetContourCenter(SwfFillContour contour)
-        {
-            Vector2 sum = Vector2.zero;
-
-            if (contour == null || contour.Points == null || contour.Points.Count == 0)
-                return sum;
-
-            for (int i = 0; i < contour.Points.Count; i++)
-            {
-                sum += contour.Points[i];
-            }
-
-            return sum / contour.Points.Count;
-        }
-
-        private bool IsInsideUnion(Vector2 point, List<SwfFillContour> contours)
-        {
-            for (int i = 0; i < contours.Count; i++)
-            {
-                SwfFillContour contour = contours[i];
-
-                if (contour == null || contour.Points == null || contour.Points.Count < 3)
-                    continue;
-
-                if (PointInPolygon(point, contour.Points))
-                    return true;
-            }
-
-            return false;
-        }
-
-        private bool IsInsideByScanline(Vector2 point, SwfFillEdgeGroup group)
-        {
-            if (group == null || group.Edges == null || group.Edges.Count == 0)
-                return false;
-
-            List<float> intersections = new List<float>();
-
-            float y = point.y;
-
-            for (int i = 0; i < group.Edges.Count; i++)
-            {
-                SwfShapeEdge edge = group.Edges[i];
-
-                Vector2 a = edge.Start;
-                Vector2 b = edge.End;
-
-                // Ignore horizontal edges.
-                if (Mathf.Abs(a.y - b.y) < 0.0001f)
-                    continue;
-
-                float minY = Mathf.Min(a.y, b.y);
-                float maxY = Mathf.Max(a.y, b.y);
-
-                // Half-open interval avoids double-counting vertices.
-                if (y < minY || y >= maxY)
-                    continue;
-
-                float t = (y - a.y) / (b.y - a.y);
-                float x = a.x + t * (b.x - a.x);
-
-                intersections.Add(x);
-            }
-
-            if (intersections.Count < 2)
-                return false;
-
-            intersections.Sort();
-
-            for (int i = 0; i < intersections.Count - 1; i += 2)
-            {
-                float x0 = intersections[i];
-                float x1 = intersections[i + 1];
-
-                if (point.x >= x0 && point.x <= x1)
-                    return true;
-            }
-
-            return false;
-        }
-
-        private bool IsInsideByWindingScanline(Vector2 point, SwfFillEdgeGroup group)
-        {
-            if (group == null || group.Edges == null || group.Edges.Count == 0)
-                return false;
-
-            int winding = 0;
-            float y = point.y;
-
-            for (int i = 0; i < group.Edges.Count; i++)
-            {
-                SwfShapeEdge edge = group.Edges[i];
-
-                Vector2 a = edge.Start;
-                Vector2 b = edge.End;
-
-                // Ignore horizontal edges.
-                if (Mathf.Abs(a.y - b.y) < 0.0001f)
-                    continue;
-
-                // Check if the edge crosses the horizontal ray to the left of the point.
-                bool crossesUp =
-                    a.y <= y &&
-                    b.y > y;
-
-                bool crossesDown =
-                    b.y <= y &&
-                    a.y > y;
-
-                if (!crossesUp && !crossesDown)
-                    continue;
-
-                float t = (y - a.y) / (b.y - a.y);
-                float x = a.x + t * (b.x - a.x);
-
-                // Count only crossings to the left of the pixel.
-                if (x > point.x)
-                    continue;
-
-                if (crossesUp)
-                {
-                    winding++;
-                }
-                else if (crossesDown)
-                {
-                    winding--;
-                }
-            }
-
-            return winding != 0;
-        }
-
-        private sealed class RasterInstance
+        private sealed class BatchInstance
         {
             public GameObject GameObject;
             public Mesh Mesh;
             public MeshRenderer Renderer;
             public MaterialPropertyBlock PropertyBlock;
-            public Vector3[] Vertices;
         }
     }
 }

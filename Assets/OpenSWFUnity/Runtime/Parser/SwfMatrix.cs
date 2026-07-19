@@ -45,6 +45,33 @@ namespace OpenSWFUnity.Runtime.Parser
             return TransformPoint(new Vector2(x, y));
         }
 
+        // Bitmap fills store the matrix that maps texture space into shape space,
+        // so deriving a UV for a shape-space point needs the inverse.
+        public bool TryInvert(out SwfMatrix inverse)
+        {
+            float determinant = ScaleX * ScaleY - RotateSkew1 * RotateSkew0;
+
+            if (Mathf.Abs(determinant) < 1e-9f)
+            {
+                inverse = Identity;
+                return false;
+            }
+
+            float invDet = 1f / determinant;
+
+            inverse = new SwfMatrix
+            {
+                ScaleX = ScaleY * invDet,
+                RotateSkew1 = -RotateSkew1 * invDet,
+                RotateSkew0 = -RotateSkew0 * invDet,
+                ScaleY = ScaleX * invDet,
+                TranslateX = (RotateSkew1 * TranslateY - ScaleY * TranslateX) * invDet,
+                TranslateY = (RotateSkew0 * TranslateX - ScaleX * TranslateY) * invDet
+            };
+
+            return true;
+        }
+
         public static SwfMatrix Combine(SwfMatrix parent, SwfMatrix child)
         {
             // SWF stores a standard affine 2x3 matrix:

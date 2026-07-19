@@ -5,6 +5,7 @@ namespace OpenSWFUnity.Runtime.Tags
     public class SwfShapeData
     {
         public ushort CharacterId;
+        public int ShapeVersion = 1;
 
         public int FillStyleCount;
         public int LineStyleCount;
@@ -13,6 +14,7 @@ namespace OpenSWFUnity.Runtime.Tags
         public int NumLineBits;
 
         public List<SwfFillStyle> FillStyles = new List<SwfFillStyle>();
+        public List<SwfLineStyle> LineStyles = new List<SwfLineStyle>();
         public List<SwfShapePath> Paths = new List<SwfShapePath>();
         public List<SwfShapeEdge> Edges = new List<SwfShapeEdge>();
         public List<SwfFillEdgeGroup> FillEdgeGroups = new List<SwfFillEdgeGroup>();
