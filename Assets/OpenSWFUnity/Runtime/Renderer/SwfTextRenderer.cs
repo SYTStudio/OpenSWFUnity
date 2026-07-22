@@ -63,8 +63,12 @@ namespace OpenSWFUnity.Runtime.Renderer
             GameObject go = instance.GameObject;
             TextMesh textMesh = instance.TextMesh;
             textMesh.text = decodedText;
-            textMesh.fontSize = 64;
-            textMesh.characterSize = characterSize;
+            // Backing raster resolution for the glyphs. characterSize is scaled
+            // inversely so a larger font is sampled more finely while occupying the
+            // same space on stage: quality changes sharpness, never layout.
+            int fontSize = Mathf.Max(8, SwfRenderQuality.Settings.TextFontSize);
+            textMesh.fontSize = fontSize;
+            textMesh.characterSize = characterSize * (64f / fontSize);
             textMesh.anchor = TextAnchor.UpperLeft;
             textMesh.alignment = TextAlignment.Left;
             Color c = record.Color;

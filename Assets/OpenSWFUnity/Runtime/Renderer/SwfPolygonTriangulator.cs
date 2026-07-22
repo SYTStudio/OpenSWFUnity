@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 using OpenSWFUnity.Runtime.Tags;
 
@@ -12,7 +12,9 @@ namespace OpenSWFUnity.Runtime.Renderer
         public static void Triangulate(
             List<SwfFillContour> contours,
             List<Vector2> outVertices,
-            List<int> outTriangles
+            List<int> outTriangles,
+            int characterId = 0,
+            int groupIndex = 0
         )
         {
             outVertices.Clear();
@@ -83,7 +85,7 @@ namespace OpenSWFUnity.Runtime.Renderer
                     outer = MergeHole(outer, hole);
                 }
 
-                EarClip(outer, outVertices, outTriangles);
+                EarClip(outer, outVertices, outTriangles, characterId, groupIndex);
             }
         }
 
@@ -296,7 +298,13 @@ namespace OpenSWFUnity.Runtime.Renderer
         // fan so the shape never just disappears.
         private const int MaxEarClipIterations = 20000;
 
-        private static void EarClip(List<Vector2> polygon, List<Vector2> outVertices, List<int> outTriangles)
+        private static void EarClip(
+            List<Vector2> polygon,
+            List<Vector2> outVertices,
+            List<int> outTriangles,
+            int characterId,
+            int groupIndex
+        )
         {
             int n = polygon.Count;
 
@@ -375,8 +383,22 @@ namespace OpenSWFUnity.Runtime.Renderer
                     break; // degenerate polygon; stop rather than looping forever
             }
 
-            // Guard tripped or a degenerate remainder was left behind: fan the
-            // rest from its first vertex instead of dropping the shape.
+            // Reaching here with more than a triangle left means ear clipping could
+            // not consume the polygon: either the guard tripped or the outline is
+            // self-intersecting. The remainder is still fanned so the shape does not
+            // vanish, but the fault is reported rather than hidden.
+            if (indices.Count > 3)
+            {
+                SwfRenderDiagnostics.Report(
+                    SwfRenderProblem.TriangulationFailed,
+                    characterId,
+                    groupIndex,
+                    "ear clipping left " + indices.Count + " of " + n +
+                    " vertices unconsumed in fill group " + groupIndex +
+                    "; the remainder was closed with a triangle fan, which can look " +
+                    "wrong on a self-intersecting outline");
+            }
+
             for (int i = 1; i + 1 < indices.Count; i++)
             {
                 outTriangles.Add(baseIndex + indices[0]);

@@ -6,6 +6,8 @@ Shader "OpenSWFUnity/SWF Vector Batched"
         _StencilRef ("Stencil Ref", Float) = 0
         _StencilComp ("Stencil Comparison", Float) = 8
         _StencilPass ("Stencil Pass", Float) = 0
+        _StencilReadMask ("Stencil Read Mask", Float) = 255
+        _StencilWriteMask ("Stencil Write Mask", Float) = 255
         _ColorMask ("Color Mask", Float) = 15
     }
 
@@ -30,8 +32,8 @@ Shader "OpenSWFUnity/SWF Vector Batched"
             Ref [_StencilRef]
             Comp [_StencilComp]
             Pass [_StencilPass]
-            ReadMask 255
-            WriteMask 255
+            ReadMask [_StencilReadMask]
+            WriteMask [_StencilWriteMask]
         }
 
         Pass

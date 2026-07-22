@@ -1,15 +1,18 @@
-using UnityEngine;
+﻿using UnityEngine;
 using OpenSWFUnity.Runtime.Parser;
 using OpenSWFUnity.Runtime.Renderer;
 using OpenSWFUnity.Runtime.Tags;
 using OpenSWFUnity.Runtime.Audio;
 using OpenSWFUnity.Runtime.AVM1;
+using OpenSWFUnity.Runtime.AVM2;
+using OpenSWFUnity.Runtime.Script;
 using System.Collections.Generic;
 using UnityEngine.InputSystem;
+using Unity.Profiling;
 
 namespace OpenSWFUnity.Runtime
 {
-    public class SwfPlayer : MonoBehaviour
+    public partial class SwfPlayer : MonoBehaviour
     {
 
         public static SwfPlayer Instance { get; private set; }
@@ -24,12 +27,15 @@ namespace OpenSWFUnity.Runtime
 
         [Tooltip("Shows the optional console-style library before starting the movie.")]
         public bool showLibraryOnStart = false;
+        // Kept as the inspector-facing name so existing scenes keep their value.
+        // The values line up with SwfQualityLevel, which is what the renderer,
+        // parser and texture cache actually read.
         public enum RenderQuality
         {
-            Low = 1,
-            Medium = 2,
-            High = 4,
-            Ultra = 8
+            Low = 0,
+            Medium = 1,
+            High = 2,
+            Ultra = 3
         }
 
         [Header("Render Options")]
@@ -108,6 +114,9 @@ namespace OpenSWFUnity.Runtime
         [Tooltip("Executes ActionScript 1 and ActionScript 2 bytecode through the AVM1 runtime.")]
         public bool enableAvm1 = true;
 
+        [Header("ActionScript 3 (AVM2)")]
+        [Tooltip("Executes ActionScript 3 bytecode through the AVM2 runtime when supported.")]
+        public bool enableAvm2 = true;
 
         private SwfParser runtimeParser;
         private SwfDebugRenderer runtimeDebugRenderer;
@@ -115,13 +124,19 @@ namespace OpenSWFUnity.Runtime
         private SwfTextRenderer runtimeTextRenderer;
         private float timelineTimer;
         private int currentTimelineFrame;
+        private long timelineTickSerial;
         private float swfFrameRate = 30f;
+        // Rebuilt every rendered frame. Entries are reused in place and `activeButtonCount`
+        // marks how many are live, so a stage full of buttons allocates nothing per frame.
         private readonly List<ActiveButtonInstance> activeButtons = new List<ActiveButtonInstance>();
+        private int activeButtonCount;
         private string hoveredButtonPath;
         private string pressedButtonPath;
         private bool pressedButtonIsOutDown;
         private SwfAudioRuntime runtimeAudio;
         private Avm1Runtime runtimeAvm1;
+        private Avm2Runtime runtimeAvm2;
+        private ISwfScriptRuntime currentScriptRuntime;
         private readonly Dictionary<string, int> avm1LastExecutedFrames =
             new Dictionary<string, int>();
         private readonly List<DynamicMovieClip> dynamicMovieClips =
@@ -138,6 +153,50 @@ namespace OpenSWFUnity.Runtime
         private readonly Dictionary<Avm1Object, StaticDisplayInstance> staticDisplayInstancesByObject =
             new Dictionary<Avm1Object, StaticDisplayInstance>();
         private int nextMaskStencilReference = 1;
+
+        // Extracting a control tag's action bytes copies them out of the SWF buffer.
+        // The timeline re-enters the same frames on every loop, so the copies are
+        // memoised by tag reference (each tag is always read with the same skip) to
+        // stop allocating a fresh byte[] every time a frame's script runs.
+        private readonly Dictionary<SwfTag, byte[]> actionByteCache =
+            new Dictionary<SwfTag, byte[]>();
+
+        // Reused per rendered frame by the top-level traversal instead of
+        // allocating a new stack each time. Not shared with the recursive sprite
+        // traversal, which needs its own per-call stack.
+        private readonly Stack<int> rootTimelineMaskDepths = new Stack<int>();
+        private readonly List<int> spriteMaskDepthStack = new List<int>();
+        private readonly List<StaticDisplayInstance> enterFrameBuffer =
+            new List<StaticDisplayInstance>();
+
+        // Reused snapshot buffer for clip key events, so a held key does not
+        // allocate a fresh list every frame it fires.
+        private readonly List<StaticDisplayInstance> keyEventInstanceBuffer =
+            new List<StaticDisplayInstance>();
+
+        // Event callbacks with no arguments share one empty array rather than
+        // allocating object[0] on every dispatch.
+        private static readonly object[] NoArgs = System.Array.Empty<object>();
+
+        // The timeline may need to advance several logical frames in one Update
+        // when a hitch makes deltaTime exceed the frame duration. Capping the
+        // catch-up keeps a long stall from turning into a spiral of death while
+        // still preventing the movie from running in slow motion.
+        private const int MaxTimelineCatchUpSteps = 4;
+
+        // Flash's default "a script is running slowly" timeout. ScriptLimits is
+        // expressed relative to this, so it is the baseline used to scale the AVM1
+        // instruction budget upward for movies that request more headroom.
+        private const int DefaultFlashScriptTimeoutSeconds = 15;
+
+        private static readonly ProfilerMarker updateMarker =
+            new ProfilerMarker("SwfPlayer.TimelineUpdate");
+        private static readonly ProfilerMarker parseMarker =
+            new ProfilerMarker("SwfPlayer.ParseTags");
+        private static readonly ProfilerMarker timelineActionsMarker =
+            new ProfilerMarker("SwfPlayer.ExecuteTimelineActions");
+        private static readonly ProfilerMarker renderMarker =
+            new ProfilerMarker("SwfPlayer.RenderCurrentFrame");
 
         public event System.Action<DefineButton2Tag, SwfButtonCondAction> ButtonActionTriggered;
 
@@ -162,12 +221,14 @@ namespace OpenSWFUnity.Runtime
         {
             timelineTimer = 0f;
             currentTimelineFrame = 0;
+            timelineTickSerial++;
+            runtimeAudio?.StopAll();
             debugFrame = 0;
             debugTimelineFrame = 0;
 
             if (runtimeParser != null)
             {
-                InitializeAvm1(runtimeParser);
+                InitializeScriptRuntime(runtimeParser);
                 ExecuteCurrentTimelineActions();
                 RenderCurrentFrame();
             }
@@ -182,6 +243,8 @@ namespace OpenSWFUnity.Runtime
             if (runtimeParser == null)
                 return;
 
+            SyncQualityIfChanged();
+
             if (inputEnabled)
             {
                 HandlePointerInput();
@@ -191,21 +254,46 @@ namespace OpenSWFUnity.Runtime
             if (!enableTimelinePlayback)
                 return;
 
-            timelineTimer += Time.deltaTime;
-
-            float frameDuration = 1f / Mathf.Max(1f, swfFrameRate);
-
-            if (timelineTimer >= frameDuration)
+            using (updateMarker.Auto())
             {
-                timelineTimer -= frameDuration;
+                timelineTimer += Time.deltaTime;
 
-                if (autoPlayTimeline)
-                    currentTimelineFrame++;
+                float frameDuration = 1f / Mathf.Max(1f, swfFrameRate);
+                int steps = 0;
 
-                AdvanceStaticMovieClips();
-                AdvanceDynamicMovieClips();
-                ExecuteCurrentTimelineActions();
-                RenderCurrentFrame();
+                // Advance the timeline logic for each elapsed frame, but render only
+                // once at the end: catching up five frames is five timeline steps and
+                // one draw, exactly like Flash, not five redundant redraws.
+                while (timelineTimer >= frameDuration && steps < MaxTimelineCatchUpSteps)
+                {
+                    timelineTimer -= frameDuration;
+                    steps++;
+                    timelineTickSerial++;
+
+                    if (autoPlayTimeline)
+                        currentTimelineFrame++;
+
+                    AdvanceStaticMovieClips();
+                    AdvanceDynamicMovieClips();
+                    ExecuteCurrentTimelineActions();
+                    AdvanceAvm2Frame();
+                }
+
+                if (steps >= MaxTimelineCatchUpSteps)
+                {
+                    // A stall longer than the catch-up cap is dropped rather than
+                    // repaid, so a momentary freeze cannot snowball into a spiral of
+                    // death where each Update owes ever more frames than it can run.
+                    timelineTimer = 0f;
+                }
+
+                if (steps > 0)
+                    RenderCurrentFrame();
+
+                // Streaming audio is positioned from the playhead rather than left to
+                // free-run, so a stop, a seek or a dropped catch-up frame cannot let
+                // it drift away from the picture.
+                runtimeAudio?.SyncStreamToFrame(currentTimelineFrame, autoPlayTimeline);
             }
         }
 
@@ -219,6 +307,9 @@ namespace OpenSWFUnity.Runtime
 
             try
             {
+                // Before parsing: curve subdivision is baked into the shape records.
+                ApplyQualityBeforeLoad();
+
                 SwfParser parser = new SwfParser(swfFile.bytes);
                 parser.VerboseLogging = verboseLogging;
 
@@ -226,7 +317,8 @@ namespace OpenSWFUnity.Runtime
                 if (verboseLogging)
                     Debug.Log(header.ToString());
 
-                parser.ParseTags();
+                using (parseMarker.Auto())
+                    parser.ParseTags();
 
                 runtimeParser = parser;
                 runtimeDebugRenderer = new SwfDebugRenderer(
@@ -257,7 +349,8 @@ namespace OpenSWFUnity.Runtime
                     runtimeAudio = gameObject.AddComponent<SwfAudioRuntime>();
 
                 runtimeAudio.Initialize(parser);
-                InitializeAvm1(parser);
+
+                InitializeScriptRuntime(parser);
                 ExecuteCurrentTimelineActions();
 
                 if (verboseLogging)
@@ -381,6 +474,8 @@ namespace OpenSWFUnity.Runtime
             if (runtimeParser == null)
                 return;
 
+            using var _profilerScope = renderMarker.Auto();
+
             runtimeRasterRenderer?.BeginFrame();
             runtimeTextRenderer?.BeginFrame();
             nextMaskStencilReference = 1;
@@ -388,7 +483,7 @@ namespace OpenSWFUnity.Runtime
             try
             {
                 ClearDebugLines();
-                activeButtons.Clear();
+                activeButtonCount = 0;
 
                 debugTimelineFrame = currentTimelineFrame;
 
@@ -463,14 +558,14 @@ namespace OpenSWFUnity.Runtime
             }
 
             debugFrame = rootFrame;
-            Stack<int> timelineMaskDepths = new Stack<int>();
+            rootTimelineMaskDepths.Clear();
 
             foreach (PlaceObject2Tag placed in places)
             {
-                while (timelineMaskDepths.Count > 0 && placed.Depth > timelineMaskDepths.Peek())
+                while (rootTimelineMaskDepths.Count > 0 && placed.Depth > rootTimelineMaskDepths.Peek())
                 {
                     runtimeRasterRenderer?.EndStencil();
-                    timelineMaskDepths.Pop();
+                    rootTimelineMaskDepths.Pop();
                 }
 
                 if (!placed.HasCharacter || placed.CharacterId == 0)
@@ -496,6 +591,13 @@ namespace OpenSWFUnity.Runtime
                         runtimeAvm1.RootObject
                     )
                     : null;
+
+                // A MovieClip assigned through setMask participates only in the
+                // stencil pass. Drawing a timeline/static mask here as ordinary art
+                // made it appear twice and cover the clipped object.
+                if (instance != null && IsObjectUsedAsMask(instance.ScriptObject))
+                    continue;
+
                 SwfMatrix effectiveMatrix = instance != null
                     ? BuildDynamicMovieClipMatrix(instance.ScriptObject)
                     : placed.Matrix;
@@ -508,6 +610,18 @@ namespace OpenSWFUnity.Runtime
                     !Avm1Boolean(instance.ScriptObject.Get("_visible"), true))
                 {
                     continue;
+                }
+
+                // _alpha applies to timeline-placed clips exactly as it does to attached
+                // ones; without this a script fading a clip in or out had no effect.
+                if (instance != null)
+                {
+                    alpha *= Mathf.Clamp01(
+                        Avm1Float(instance.ScriptObject.Get("_alpha"), 100f) / 100f
+                    );
+
+                    if (alpha <= 0.001f)
+                        continue;
                 }
 
                 if (placed.HasVisible && placed.Visible == 0)
@@ -539,17 +653,18 @@ namespace OpenSWFUnity.Runtime
                 {
                     int reference = nextMaskStencilReference - 1;
                     runtimeRasterRenderer?.BeginMaskedContent(reference);
-                    timelineMaskDepths.Push(placed.ClipDepth);
+                    rootTimelineMaskDepths.Push(placed.ClipDepth);
                 }
             }
 
-            while (timelineMaskDepths.Count > 0)
+            while (rootTimelineMaskDepths.Count > 0)
             {
                 runtimeRasterRenderer?.EndStencil();
-                timelineMaskDepths.Pop();
+                rootTimelineMaskDepths.Pop();
             }
 
             RenderDynamicMovieClips(parser, renderer, null, SwfMatrix.Identity, 1f, 0);
+            RenderAvm2DisplayTree(parser, renderer);
         }
 
         private void RenderCharacterDebug(
@@ -576,31 +691,39 @@ namespace OpenSWFUnity.Runtime
                     nextMaskStencilReference = 1;
 
                 runtimeRasterRenderer?.BeginMaskWrite(stencilReference);
-                RenderMaskObject(
-                    parser,
-                    renderer,
-                    scriptObject,
-                    maskObject,
-                    worldMatrix,
-                    path + "_Mask"
-                );
-                runtimeRasterRenderer?.BeginMaskedContent(stencilReference);
-                RenderCharacterDebug(
-                    parser,
-                    renderer,
-                    characterId,
-                    worldMatrix,
-                    path,
-                    alpha,
-                    localFrame,
-                    ratio,
-                    hasRatio,
-                    scriptObject,
-                    timelinePath,
-                    true,
-                    renderAttachedChildren
-                );
-                runtimeRasterRenderer?.EndStencil();
+
+                try
+                {
+                    RenderMaskObject(
+                        parser,
+                        renderer,
+                        scriptObject,
+                        maskObject,
+                        worldMatrix,
+                        path + "_Mask"
+                    );
+                    runtimeRasterRenderer?.BeginMaskedContent(stencilReference);
+                    RenderCharacterDebug(
+                        parser,
+                        renderer,
+                        characterId,
+                        worldMatrix,
+                        path,
+                        alpha,
+                        localFrame,
+                        ratio,
+                        hasRatio,
+                        scriptObject,
+                        timelinePath,
+                        true,
+                        renderAttachedChildren
+                    );
+                }
+                finally
+                {
+                    runtimeRasterRenderer?.EndStencil();
+                }
+
                 return;
             }
 
@@ -618,7 +741,6 @@ namespace OpenSWFUnity.Runtime
                     runtimeRasterRenderer?.DrawShapeRasterFill(
                         shape,
                         worldMatrix,
-                        "RasterFill_" + characterId + "_" + path,
                         alpha
                     );
                 }
@@ -709,15 +831,16 @@ namespace OpenSWFUnity.Runtime
 
             if (button != null)
             {
-                activeButtons.Add(new ActiveButtonInstance
-                {
-                    Button = button,
-                    WorldMatrix = worldMatrix,
-                    Path = path,
-                    ScriptObject = scriptObject != null
-                        ? scriptObject.Get("_parent") as Avm1Object
-                        : runtimeAvm1?.RootObject
-                });
+                ActiveButtonInstance activeButton = AcquireActiveButton();
+                activeButton.Button = button;
+                activeButton.WorldMatrix = worldMatrix;
+                activeButton.Path = path;
+
+                // Button actions run on the timeline that contains the button, which
+                // is why the parent - not the button's own object - is the receiver.
+                activeButton.ScriptObject = scriptObject != null
+                    ? scriptObject.Get("_parent") as Avm1Object
+                    : runtimeAvm1?.RootObject;
 
                 RenderButtonState(
                     parser,
@@ -827,8 +950,6 @@ namespace OpenSWFUnity.Runtime
     bool renderAttachedChildren
 )
         {
-            List<PlaceObject2Tag> places = new List<PlaceObject2Tag>();
-
             int localFrame = 0;
 
             if (sprite.Frames != null && sprite.Frames.Count > 0)
@@ -839,12 +960,18 @@ namespace OpenSWFUnity.Runtime
                     localFrame = Mathf.Clamp(spriteFrame, 0, sprite.Frames.Count - 1);
             }
 
+            List<PlaceObject2Tag> places;
+
             if (enableSpriteTimelineDebug && sprite.Frames != null && sprite.Frames.Count > 0)
             {
+                // Owned by the display-list cache and shared with every other sprite
+                // render this frame, so it must be treated as read-only here.
                 places = BuildDisplayListForFrame(parser, sprite.Frames, localFrame);
             }
             else
             {
+                places = new List<PlaceObject2Tag>();
+
                 foreach (SwfTag innerTag in sprite.ControlTags)
                 {
                     if (innerTag.Code != 26 && innerTag.Code != 70)
@@ -867,7 +994,9 @@ namespace OpenSWFUnity.Runtime
                 }
             }
 
-            Stack<int> timelineMaskDepths = new Stack<int>();
+            // Nested sprites share one stack: each call remembers where its own
+            // entries begin and unwinds back to that mark, so recursion costs nothing.
+            int maskStackBase = spriteMaskDepthStack.Count;
 
             for (int i = 0; i < places.Count; i++)
             {
@@ -876,10 +1005,11 @@ namespace OpenSWFUnity.Runtime
                 if (innerPlace == null)
                     continue;
 
-                while (timelineMaskDepths.Count > 0 && innerPlace.Depth > timelineMaskDepths.Peek())
+                while (spriteMaskDepthStack.Count > maskStackBase &&
+                       innerPlace.Depth > spriteMaskDepthStack[spriteMaskDepthStack.Count - 1])
                 {
                     runtimeRasterRenderer?.EndStencil();
-                    timelineMaskDepths.Pop();
+                    spriteMaskDepthStack.RemoveAt(spriteMaskDepthStack.Count - 1);
                 }
 
                 if (!innerPlace.HasCharacter || innerPlace.CharacterId == 0)
@@ -906,6 +1036,10 @@ namespace OpenSWFUnity.Runtime
                         spriteObject ?? runtimeAvm1.RootObject
                     )
                     : null;
+
+                if (childInstance != null && IsObjectUsedAsMask(childInstance.ScriptObject))
+                    continue;
+
                 SwfMatrix localMatrix = childInstance != null
                     ? BuildDynamicMovieClipMatrix(childInstance.ScriptObject)
                     : innerPlace.Matrix;
@@ -916,6 +1050,16 @@ namespace OpenSWFUnity.Runtime
                     !Avm1Boolean(childInstance.ScriptObject.Get("_visible"), true))
                 {
                     continue;
+                }
+
+                if (childInstance != null)
+                {
+                    childAlpha *= Mathf.Clamp01(
+                        Avm1Float(childInstance.ScriptObject.Get("_alpha"), 100f) / 100f
+                    );
+
+                    if (childAlpha <= 0.001f)
+                        continue;
                 }
 
                 if (innerPlace.HasVisible && innerPlace.Visible == 0)
@@ -954,14 +1098,14 @@ namespace OpenSWFUnity.Runtime
                 {
                     int reference = nextMaskStencilReference - 1;
                     runtimeRasterRenderer?.BeginMaskedContent(reference);
-                    timelineMaskDepths.Push(innerPlace.ClipDepth);
+                    spriteMaskDepthStack.Add(innerPlace.ClipDepth);
                 }
             }
 
-            while (timelineMaskDepths.Count > 0)
+            while (spriteMaskDepthStack.Count > maskStackBase)
             {
                 runtimeRasterRenderer?.EndStencil();
-                timelineMaskDepths.Pop();
+                spriteMaskDepthStack.RemoveAt(spriteMaskDepthStack.Count - 1);
             }
 
             if (spriteObject != null && renderAttachedChildren)
@@ -984,12 +1128,35 @@ namespace OpenSWFUnity.Runtime
             if (scriptObject == null)
                 return false;
 
+            StaticDisplayInstance staticClip = null;
+
             if (dynamicMovieClipsByObject.TryGetValue(scriptObject, out DynamicMovieClip dynamicClip))
                 maskObject = dynamicClip.MaskObject;
-            else if (staticDisplayInstancesByObject.TryGetValue(scriptObject, out StaticDisplayInstance staticClip))
+            else if (staticDisplayInstancesByObject.TryGetValue(scriptObject, out staticClip))
                 maskObject = staticClip.MaskObject;
 
-            return maskObject != null;
+            if (maskObject == null)
+                return false;
+
+            bool usable =
+                dynamicMovieClipsByObject.TryGetValue(maskObject, out DynamicMovieClip dynamicMask)
+                    ? !dynamicMask.Removed && dynamicMask.CharacterId != 0
+                    : staticDisplayInstancesByObject.TryGetValue(maskObject, out StaticDisplayInstance staticMask) &&
+                      staticMask.CharacterId != 0;
+
+            if (usable)
+                return true;
+
+            // A removed/replaced mask must stop clipping immediately. Keeping the
+            // stale object reference made RenderMaskObject write no stencil and hid
+            // the complete target on every later frame.
+            if (dynamicMovieClipsByObject.TryGetValue(scriptObject, out dynamicClip))
+                dynamicClip.MaskObject = null;
+            else if (staticDisplayInstancesByObject.TryGetValue(scriptObject, out staticClip))
+                staticClip.MaskObject = null;
+
+            maskObject = null;
+            return false;
         }
 
         private bool IsObjectUsedAsMask(Avm1Object scriptObject)
@@ -1082,6 +1249,7 @@ namespace OpenSWFUnity.Runtime
                 return;
 
             UpdateAvm1MouseCoordinates(flashPoint);
+            DispatchAvm2PointerEvents(flashPoint);
 
             if (Mouse.current.delta.ReadValue().sqrMagnitude > 0.0001f)
                 runtimeAvm1?.Broadcast("Mouse", "onMouseMove");
@@ -1091,7 +1259,7 @@ namespace OpenSWFUnity.Runtime
             else if (Mouse.current.leftButton.wasReleasedThisFrame)
                 runtimeAvm1?.Broadcast("Mouse", "onMouseUp");
 
-            if (activeButtons.Count == 0)
+            if (activeButtonCount == 0)
                 return;
 
             ActiveButtonInstance hit = FindTopButtonAt(flashPoint);
@@ -1207,8 +1375,14 @@ namespace OpenSWFUnity.Runtime
 
         private void HandleKeyboardInput()
         {
-            if (runtimeAvm1 == null || Keyboard.current == null)
+            if (Keyboard.current == null)
                 return;
+
+            if (runtimeAvm1 == null)
+            {
+                DispatchAvm2KeyboardInput();
+                return;
+            }
 
             var keys = Keyboard.current.allKeys;
 
@@ -1227,19 +1401,23 @@ namespace OpenSWFUnity.Runtime
                 int asciiCode = ToFlashAsciiCode(keyControl.keyCode, flashCode);
                 bool pressed = keyControl.wasPressedThisFrame;
                 runtimeAvm1.SetKeyState(flashCode, asciiCode, pressed);
+                DispatchAvm2KeyEvent(pressed, flashCode, asciiCode);
                 runtimeAvm1.Broadcast("Key", pressed ? "onKeyDown" : "onKeyUp");
-                List<StaticDisplayInstance> instances =
-                    new List<StaticDisplayInstance>(staticDisplayInstances.Values);
 
-                for (int instanceIndex = 0; instanceIndex < instances.Count; instanceIndex++)
+                // Snapshot into a reused buffer because a triggered handler may add
+                // or remove display instances while we iterate.
+                keyEventInstanceBuffer.Clear();
+                keyEventInstanceBuffer.AddRange(staticDisplayInstances.Values);
+
+                for (int instanceIndex = 0; instanceIndex < keyEventInstanceBuffer.Count; instanceIndex++)
                 {
                     TriggerClipActions(
-                        instances[instanceIndex],
+                        keyEventInstanceBuffer[instanceIndex],
                         pressed ? 0x00000002u : 0x00000001u
                     );
 
                     if (pressed)
-                        TriggerClipActions(instances[instanceIndex], 0x00020000u, (byte)flashCode);
+                        TriggerClipActions(keyEventInstanceBuffer[instanceIndex], 0x00020000u, (byte)flashCode);
                 }
             }
         }
@@ -1394,12 +1572,23 @@ namespace OpenSWFUnity.Runtime
             scriptObject.Set("_ymouse", localY);
         }
 
+        private ActiveButtonInstance AcquireActiveButton()
+        {
+            if (activeButtonCount < activeButtons.Count)
+                return activeButtons[activeButtonCount++];
+
+            ActiveButtonInstance created = new ActiveButtonInstance();
+            activeButtons.Add(created);
+            activeButtonCount++;
+            return created;
+        }
+
         private ActiveButtonInstance FindButtonByPath(string path)
         {
             if (string.IsNullOrEmpty(path))
                 return null;
 
-            for (int i = 0; i < activeButtons.Count; i++)
+            for (int i = 0; i < activeButtonCount; i++)
             {
                 if (string.Equals(activeButtons[i].Path, path, System.StringComparison.Ordinal))
                     return activeButtons[i];
@@ -1473,7 +1662,7 @@ namespace OpenSWFUnity.Runtime
 
         private ActiveButtonInstance FindTopButtonAt(Vector2 flashPoint)
         {
-            for (int i = activeButtons.Count - 1; i >= 0; i--)
+            for (int i = activeButtonCount - 1; i >= 0; i--)
             {
                 ActiveButtonInstance instance = activeButtons[i];
 
@@ -1557,6 +1746,98 @@ namespace OpenSWFUnity.Runtime
             return inside;
         }
 
+        private void InitializeScriptRuntime(SwfParser parser)
+        {
+            runtimeAvm1 = null;
+            runtimeAvm2 = null;
+            currentScriptRuntime = null;
+            avm1LastExecutedFrames.Clear();
+            dynamicMovieClips.Clear();
+            dynamicMovieClipsByObject.Clear();
+            staticDisplayInstances.Clear();
+            staticDisplayInstancesByObject.Clear();
+            displayListCache.Clear();
+            actionByteCache.Clear();
+
+            if (parser == null)
+                return;
+
+            if (parser.DoAbcBlocks != null && parser.DoAbcBlocks.Count > 0)
+            {
+                if (enableAvm2)
+                {
+                    InitializeAvm2(parser);
+                    return;
+                }
+
+                Debug.LogWarning(
+                    "SWF contains DoABC blocks, but AVM2 execution is disabled. " +
+                    "ActionScript 3 content will not execute."
+                );
+            }
+
+            InitializeAvm1(parser);
+        }
+
+        private void InitializeAvm2(SwfParser parser)
+        {
+            runtimeAvm2 = new Avm2Runtime()
+            {
+                VerboseLogging = verboseLogging,
+                ExternalMethod = HandleAvm2ExternalMethod,
+                ExternalFunction = HandleAvm2ExternalFunction,
+                Trace = message => Debug.Log("[AVM2] " + message),
+                Warning = message => Debug.LogWarning("[AVM2] " + message)
+            };
+
+            currentScriptRuntime = runtimeAvm2;
+
+            for (int i = 0; i < parser.DoAbcBlocks.Count; i++)
+            {
+                SwfDoAbcBlock abcBlock = parser.DoAbcBlocks[i];
+                runtimeAvm2.RegisterFunctions(abcBlock.AbcData, abcBlock.Name);
+
+                if (verboseLogging)
+                {
+                    Debug.Log(
+                        "Registered DoABC block: " +
+                        (string.IsNullOrEmpty(abcBlock.Name) ? "<anonymous>" : abcBlock.Name) +
+                        " Size=" + abcBlock.AbcData.Length
+                    );
+                }
+            }
+
+            if (verboseLogging)
+            {
+                Debug.Log(runtimeAvm2.DescribeDiagnostics());
+
+                // Names the instructions this movie actually needs, which is the input
+                // for deciding what an AS3 interpreter would have to cover.
+                Debug.Log(runtimeAvm2.DescribeOpCodeUsage());
+            }
+
+            InitializeAvm2Display(parser);
+
+            if (parser.DoAbcBlocks.Count > 0)
+            {
+                Debug.Log(
+                    "This SWF is ActionScript 3 (" + parser.DoAbcBlocks.Count + " DoABC block(s)). " +
+                    runtimeAvm2.DescribeDiagnostics()
+                );
+
+                if (runtimeAvm2.FailedScriptCount > 0)
+                {
+                    Debug.LogWarning(
+                        runtimeAvm2.FailedScriptCount + " of " + parser.DoAbcBlocks.Count +
+                        " ActionScript 3 block(s) stopped during initialisation. The display and " +
+                        "event core (Sprite, MovieClip, Shape, TextField, EventDispatcher) is " +
+                        "available; anything outside it is not, and is named in the warnings " +
+                        "above. The timeline still renders regardless."
+                    );
+                }
+            }
+        }
+
         private void InitializeAvm1(SwfParser parser)
         {
             runtimeAvm1 = null;
@@ -1570,12 +1851,63 @@ namespace OpenSWFUnity.Runtime
             if (!enableAvm1 || parser == null)
                 return;
 
+            characterBoundsCache.Clear();
+            characterBoundsInProgress.Clear();
+
             runtimeAvm1 = new Avm1Runtime(parser.Header.Version >= 7)
             {
                 VerboseLogging = verboseLogging,
                 ExternalMethod = HandleAvm1ExternalMethod,
+                ComputedPropertyGetter = GetDisplayObjectComputedProperty,
+                ComputedPropertySetter = SetDisplayObjectComputedProperty,
                 Trace = message => Debug.Log("[AVM1] " + message)
             };
+
+            currentScriptRuntime = runtimeAvm1;
+
+            // A movie that ships a ScriptLimits tag is explicitly asking for more
+            // script headroom than the default. Honour it by scaling the AVM1
+            // instruction budget up in proportion to the requested timeout, clamped
+            // so it can only ever rise above the default safety cap - never fall
+            // below it - so existing content cannot start tripping the guard sooner.
+            if (parser.HasScriptLimits &&
+                parser.ScriptTimeoutSeconds > DefaultFlashScriptTimeoutSeconds)
+            {
+                long scaledBudget =
+                    (long)Avm1Runtime.DefaultInstructionBudget *
+                    parser.ScriptTimeoutSeconds /
+                    DefaultFlashScriptTimeoutSeconds;
+
+                runtimeAvm1.InstructionBudget = (int)System.Math.Min(
+                    int.MaxValue,
+                    System.Math.Max(Avm1Runtime.DefaultInstructionBudget, scaledBudget)
+                );
+
+                if (verboseLogging)
+                {
+                    Debug.Log(
+                        "Raised AVM1 instruction budget to " + runtimeAvm1.InstructionBudget +
+                        " from ScriptLimits (timeout=" + parser.ScriptTimeoutSeconds + "s)"
+                    );
+                }
+            }
+
+            // Same one-way rule for recursion: the movie may ask for a deeper call
+            // stack than the default guard allows, but never a shallower one, since
+            // the guard is what stops runaway recursion from overflowing the CLR stack.
+            if (parser.HasScriptLimits &&
+                parser.ScriptMaxRecursionDepth > Avm1Runtime.DefaultMaxCallDepth)
+            {
+                runtimeAvm1.MaxCallDepth = parser.ScriptMaxRecursionDepth;
+
+                if (verboseLogging)
+                {
+                    Debug.Log(
+                        "Raised AVM1 call depth limit to " + runtimeAvm1.MaxCallDepth +
+                        " from ScriptLimits"
+                    );
+                }
+            }
 
             runtimeAvm1.SetVariable("MOVIE_WIDTH", parser.Header.StageWidth);
             runtimeAvm1.SetVariable("MOVIE_HEIGHT", parser.Header.StageHeight);
@@ -1589,26 +1921,39 @@ namespace OpenSWFUnity.Runtime
                 stageObject.Set("height", parser.Header.StageHeight);
             }
 
+            ISwfScriptRuntime scriptRuntime = runtimeAvm1;
+
             for (int i = 0; i < parser.Tags.Count; i++)
             {
                 SwfTag tag = parser.Tags[i];
 
                 if (tag.Code == 12)
-                    runtimeAvm1.RegisterFunctions(parser.CopyTagData(tag));
+                    scriptRuntime.RegisterFunctions(parser.CopyTagData(tag));
                 else if (tag.Code == 59)
-                    runtimeAvm1.RegisterFunctions(parser.CopyTagData(tag, 2));
-            }
-
-            for (int i = 0; i < parser.Tags.Count; i++)
-            {
-                SwfTag tag = parser.Tags[i];
-
-                if (tag.Code == 59)
-                    runtimeAvm1.Execute(parser.CopyTagData(tag, 2));
+                    scriptRuntime.RegisterFunctions(parser.CopyTagData(tag, 2));
             }
 
             if (verboseLogging)
-                Debug.Log("AVM1 initialized. Functions=" + runtimeAvm1.DefinedFunctionCount);
+                Debug.Log("AVM1 initialized. " + runtimeAvm1.DescribeDiagnostics());
+        }
+
+        private void ExecuteInitActionsForCharacter(ushort characterId, Avm1Object targetObject)
+        {
+            if (runtimeParser == null || runtimeAvm1 == null || targetObject == null)
+                return;
+
+            for (int i = 0; i < runtimeParser.InitActions.Count; i++)
+            {
+                SwfInitAction initAction = runtimeParser.InitActions[i];
+
+                if (initAction == null || initAction.SpriteId != characterId ||
+                    initAction.ActionBytes == null || initAction.ActionBytes.Length == 0)
+                {
+                    continue;
+                }
+
+                runtimeAvm1.Execute(initAction.ActionBytes, targetObject);
+            }
         }
 
         private void ExecuteCurrentTimelineActions()
@@ -1616,10 +1961,18 @@ namespace OpenSWFUnity.Runtime
             if (runtimeAvm1 == null || runtimeParser == null)
                 return;
 
+            using var _profilerScope = timelineActionsMarker.Auto();
+
             if (runtimeParser.RootFrames != null && runtimeParser.RootFrames.Count > 0)
             {
                 int rootFrame = currentTimelineFrame % runtimeParser.RootFrames.Count;
                 SwfFrame frame = runtimeParser.RootFrames[rootFrame];
+
+                // Kept in step with the root timeline so `_root._currentframe` and the
+                // bare `_currentframe` read from a root script report the live frame.
+                // Flash frame numbers are 1-based.
+                runtimeAvm1.RootObject.Set("_currentframe", rootFrame + 1);
+
                 List<PlaceObject2Tag> places = BuildDisplayListForFrame(
                     runtimeParser,
                     runtimeParser.RootFrames,
@@ -1655,20 +2008,36 @@ namespace OpenSWFUnity.Runtime
                 );
             }
 
-            runtimeAvm1.TryCallFunction("onEnterFrame", new object[0], out _);
+            runtimeAvm1.TryCallFunction("onEnterFrame", NoArgs, out _);
+
+            // Dispatched from a snapshot: the handlers below run arbitrary script, and
+            // anything that registers a new display instance mid-dispatch would
+            // otherwise invalidate the dictionary enumerator. Taking a copy also gives
+            // the Flash behaviour that a clip created during this frame first receives
+            // enterFrame on the next one. The buffer is reused, so this does not
+            // allocate once the scene has settled.
+            enterFrameBuffer.Clear();
 
             foreach (StaticDisplayInstance instance in staticDisplayInstances.Values)
+                enterFrameBuffer.Add(instance);
+
+            for (int i = 0; i < enterFrameBuffer.Count; i++)
             {
+                StaticDisplayInstance instance = enterFrameBuffer[i];
                 TriggerClipActions(instance, 0x00000040u);
-                runtimeAvm1.TryCallMethod(instance.ScriptObject, "onEnterFrame", new object[0], out _);
+                runtimeAvm1.TryCallMethod(instance.ScriptObject, "onEnterFrame", NoArgs, out _);
             }
 
-            for (int i = 0; i < dynamicMovieClips.Count; i++)
+            enterFrameBuffer.Clear();
+
+            int dynamicCount = dynamicMovieClips.Count;
+
+            for (int i = 0; i < dynamicCount; i++)
             {
                 DynamicMovieClip clip = dynamicMovieClips[i];
 
                 if (!clip.Removed)
-                    runtimeAvm1.TryCallMethod(clip.ScriptObject, "onEnterFrame", new object[0], out _);
+                    runtimeAvm1.TryCallMethod(clip.ScriptObject, "onEnterFrame", NoArgs, out _);
             }
         }
 
@@ -1761,6 +2130,23 @@ namespace OpenSWFUnity.Runtime
             }
         }
 
+        // Returns the control tag's action payload, copying it out of the SWF
+        // buffer only the first time and reusing that array on every subsequent
+        // execution of the same tag.
+        private byte[] GetActionBytes(SwfTag tag, int skipBytes)
+        {
+            if (tag == null || runtimeParser == null)
+                return System.Array.Empty<byte>();
+
+            if (!actionByteCache.TryGetValue(tag, out byte[] bytes))
+            {
+                bytes = runtimeParser.CopyTagData(tag, skipBytes);
+                actionByteCache[tag] = bytes;
+            }
+
+            return bytes;
+        }
+
         private void ExecuteTimelineControlTag(SwfTag tag, Avm1Object thisObject)
         {
             if (tag == null)
@@ -1768,31 +2154,41 @@ namespace OpenSWFUnity.Runtime
 
             if (tag.Code == 12)
             {
-                runtimeAvm1?.Execute(runtimeParser.CopyTagData(tag), thisObject);
+                currentScriptRuntime?.Execute(GetActionBytes(tag, 0), thisObject);
+                return;
+            }
+
+            if (tag.Code == 59)
+            {
+                ushort spriteId = runtimeParser.ParseDoInitActionSpriteId(tag);
+
+                if (spriteId == 0)
+                {
+                    currentScriptRuntime?.Execute(GetActionBytes(tag, 2), thisObject);
+                }
                 return;
             }
 
             if (tag.Code == 15)
             {
-                byte[] startSound = runtimeParser.CopyTagData(tag);
+                byte[] startSound = GetActionBytes(tag, 0);
 
                 if (startSound.Length < 2)
                     return;
 
                 ushort soundId = (ushort)(startSound[0] | (startSound[1] << 8));
-                bool syncStop = startSound.Length > 2 && (startSound[2] & 0x20) != 0;
 
-                if (syncStop)
-                    runtimeAudio?.StopSound(soundId);
-                else
-                    runtimeAudio?.PlaySound(soundId);
+                // The SOUNDINFO record after the id carries stop, no-multiple, loop
+                // count, in/out points and the volume envelope.
+                Tags.SwfSoundInfo info = runtimeParser.ParseSoundInfo(startSound, 2, out _);
+                runtimeAudio?.PlaySound(soundId, info);
 
                 return;
             }
 
             if (tag.Code == 89)
             {
-                byte[] startSound2 = runtimeParser.CopyTagData(tag);
+                byte[] startSound2 = GetActionBytes(tag, 0);
                 int terminator = 0;
 
                 while (terminator < startSound2.Length && startSound2[terminator] != 0)
@@ -1819,6 +2215,40 @@ namespace OpenSWFUnity.Runtime
             if (staticDisplayInstances.TryGetValue(path, out StaticDisplayInstance existing))
             {
                 existing.ClipActions = place.ClipActions;
+                bool reenteredTimeline = existing.LastSeenTimelineTick < timelineTickSerial - 1;
+                existing.LastSeenTimelineTick = timelineTickSerial;
+
+                // Move/update PlaceObject tags carry the authoritative matrix for
+                // this timeline frame. The old implementation initialized it only
+                // once, so replaying a timeline kept every object at its first-frame
+                // transform (usually off stage).
+                if (place.HasMatrix &&
+                    (reenteredTimeline || !MatricesApproximately(existing.TimelineMatrix, place.Matrix)))
+                {
+                    ApplyTimelineTransform(existing.ScriptObject, place.Matrix);
+                    existing.TimelineMatrix = place.Matrix;
+                }
+
+                bool timelineVisible = !place.HasVisible || place.Visible != 0;
+
+                if (reenteredTimeline)
+                {
+                    // A timeline removal followed by a later placement creates a new
+                    // display-list lifetime in Flash. Reuse the allocation, but reset
+                    // the state that must not leak from its previous appearance.
+                    existing.CurrentFrame = 0;
+                    existing.IsPlaying = true;
+                    existing.MaskObject = null;
+                    existing.ScriptObject.Set("_alpha", 100d);
+                    existing.ScriptObject.Set("_currentframe", 1);
+                }
+
+                if (reenteredTimeline || existing.TimelineVisible != timelineVisible)
+                {
+                    existing.TimelineVisible = timelineVisible;
+                    existing.ScriptObject.Set("_visible", timelineVisible);
+                }
+
                 return existing;
             }
 
@@ -1836,6 +2266,9 @@ namespace OpenSWFUnity.Runtime
                 Depth = place.Depth,
                 CurrentFrame = 0,
                 IsPlaying = true,
+                TimelineMatrix = place.Matrix,
+                TimelineVisible = !place.HasVisible || place.Visible != 0,
+                LastSeenTimelineTick = timelineTickSerial,
                 ClipActions = place.ClipActions
             };
 
@@ -1861,6 +2294,7 @@ namespace OpenSWFUnity.Runtime
                 : FindExportName(place.CharacterId);
             runtimeAvm1.ApplyRegisteredClass(registeredLinkage, scriptObject);
 
+            ExecuteInitActionsForCharacter(place.CharacterId, scriptObject);
             TriggerClipActions(instance, 0x00004000u); // Initialize
             TriggerClipActions(instance, 0x00000080u); // Load
 
@@ -1901,6 +2335,24 @@ namespace OpenSWFUnity.Runtime
             bool visible
         )
         {
+            scriptObject.Set("_root", runtimeAvm1.RootObject);
+            scriptObject.Set("_parent", parentObject ?? runtimeAvm1.RootObject);
+            scriptObject.Set("_name", instanceName ?? string.Empty);
+            scriptObject.Set("_target", targetPath);
+            scriptObject.Set("_depth", depth);
+            ApplyTimelineTransform(scriptObject, matrix);
+            scriptObject.Set("_alpha", 100d);
+            scriptObject.Set("_visible", visible);
+            scriptObject.Set("_currentframe", 1);
+            scriptObject.Set("_totalframes", GetCharacterFrameCount(characterId));
+            scriptObject.Set("__characterId", characterId);
+        }
+
+        private static void ApplyTimelineTransform(Avm1Object scriptObject, SwfMatrix matrix)
+        {
+            if (scriptObject == null)
+                return;
+
             float scaleX = Mathf.Sqrt(
                 matrix.ScaleX * matrix.ScaleX + matrix.RotateSkew0 * matrix.RotateSkew0
             );
@@ -1909,11 +2361,6 @@ namespace OpenSWFUnity.Runtime
             );
             float rotation = Mathf.Atan2(matrix.RotateSkew0, matrix.ScaleX) * Mathf.Rad2Deg;
 
-            scriptObject.Set("_root", runtimeAvm1.RootObject);
-            scriptObject.Set("_parent", parentObject ?? runtimeAvm1.RootObject);
-            scriptObject.Set("_name", instanceName ?? string.Empty);
-            scriptObject.Set("_target", targetPath);
-            scriptObject.Set("_depth", depth);
             scriptObject.Set("_x", matrix.TranslateX);
             scriptObject.Set("_y", matrix.TranslateY);
             scriptObject.Set("_xscale", scaleX * 100f);
@@ -1924,11 +2371,18 @@ namespace OpenSWFUnity.Runtime
             scriptObject.Set("__baseXScale", scaleX * 100f);
             scriptObject.Set("__baseYScale", scaleY * 100f);
             scriptObject.Set("__baseRotation", rotation);
-            scriptObject.Set("_alpha", 100d);
-            scriptObject.Set("_visible", visible);
-            scriptObject.Set("_currentframe", 1);
-            scriptObject.Set("_totalframes", GetCharacterFrameCount(characterId));
-            scriptObject.Set("__characterId", characterId);
+        }
+
+        private static bool MatricesApproximately(SwfMatrix a, SwfMatrix b)
+        {
+            const float epsilon = 0.00001f;
+            return
+                Mathf.Abs(a.ScaleX - b.ScaleX) <= epsilon &&
+                Mathf.Abs(a.ScaleY - b.ScaleY) <= epsilon &&
+                Mathf.Abs(a.RotateSkew0 - b.RotateSkew0) <= epsilon &&
+                Mathf.Abs(a.RotateSkew1 - b.RotateSkew1) <= epsilon &&
+                Mathf.Abs(a.TranslateX - b.TranslateX) <= epsilon &&
+                Mathf.Abs(a.TranslateY - b.TranslateY) <= epsilon;
         }
 
         private Avm1Object CreateDynamicMovieClip(
@@ -2004,6 +2458,7 @@ namespace OpenSWFUnity.Runtime
 
             runtimeAvm1.ApplyRegisteredClass(linkageName, scriptObject);
 
+            ExecuteInitActionsForCharacter(characterId, scriptObject);
             ExecuteDynamicClipFrameActions(clip);
             return scriptObject;
         }
@@ -2028,7 +2483,28 @@ namespace OpenSWFUnity.Runtime
                 return;
             }
 
+            // Fired before the clip is torn down, matching Flash, so the handler can
+            // still read the clip's own properties. Marking Removed first would also
+            // make a handler that re-entered removeMovieClip recurse.
             clip.Removed = true;
+
+            // Detach the mask from every owner before the object disappears. Flash
+            // does not keep clipping with a MovieClip that is no longer on stage.
+            for (int i = 0; i < dynamicMovieClips.Count; i++)
+            {
+                DynamicMovieClip owner = dynamicMovieClips[i];
+
+                if (owner != null && owner.MaskObject == scriptObject)
+                    owner.MaskObject = null;
+            }
+
+            foreach (StaticDisplayInstance owner in staticDisplayInstances.Values)
+            {
+                if (owner != null && owner.MaskObject == scriptObject)
+                    owner.MaskObject = null;
+            }
+
+            runtimeAvm1?.TryCallMethod(clip.ScriptObject, "onUnload", NoArgs, out _);
 
             if (!string.IsNullOrEmpty(clip.InstanceName))
                 clip.ParentObject?.Remove(clip.InstanceName);
@@ -2205,6 +2681,25 @@ namespace OpenSWFUnity.Runtime
             float scaleX = Avm1Float(scriptObject.Get("_xscale"), baseXScale) / 100f;
             float scaleY = Avm1Float(scriptObject.Get("_yscale"), baseYScale) / 100f;
             float rotation = Avm1Float(scriptObject.Get("_rotation"), baseRotation) * Mathf.Deg2Rad;
+            float x = Avm1Float(scriptObject.Get("_x"), baseX);
+            float y = Avm1Float(scriptObject.Get("_y"), baseY);
+
+            if (staticDisplayInstancesByObject.TryGetValue(
+                    scriptObject,
+                    out StaticDisplayInstance staticInstance) &&
+                Mathf.Abs(scaleX * 100f - baseXScale) <= 0.0001f &&
+                Mathf.Abs(scaleY * 100f - baseYScale) <= 0.0001f &&
+                Mathf.Abs(rotation * Mathf.Rad2Deg - baseRotation) <= 0.0001f)
+            {
+                // Preserve the exact SWF affine matrix, including independent skew.
+                // Script-only x/y changes can still move it without flattening that
+                // matrix into Unity-style rotation plus scale.
+                SwfMatrix exact = staticInstance.TimelineMatrix;
+                exact.TranslateX = x;
+                exact.TranslateY = y;
+                return exact;
+            }
+
             float cosine = Mathf.Cos(rotation);
             float sine = Mathf.Sin(rotation);
 
@@ -2214,9 +2709,234 @@ namespace OpenSWFUnity.Runtime
                 RotateSkew0 = sine * scaleX,
                 RotateSkew1 = -sine * scaleY,
                 ScaleY = cosine * scaleY,
-                TranslateX = Avm1Float(scriptObject.Get("_x"), baseX),
-                TranslateY = Avm1Float(scriptObject.Get("_y"), baseY)
+                TranslateX = x,
+                TranslateY = y
             };
+        }
+
+        // Local-space bounds of a character, in pixels, keyed by character id.
+        //
+        // A sprite's entry is the union of its children's bounds across every frame.
+        // Flash measures only the frame currently showing, so a clip whose contents
+        // move between frames reads larger here; for the static graphics that scripts
+        // actually measure the two agree, and a per-character value stays valid for
+        // the life of the movie instead of being recomputed as timelines advance.
+        private readonly Dictionary<ushort, Rect> characterBoundsCache =
+            new Dictionary<ushort, Rect>();
+        private readonly HashSet<ushort> characterBoundsInProgress = new HashSet<ushort>();
+
+        private static readonly Rect EmptyCharacterBounds = new Rect(0f, 0f, -1f, -1f);
+
+        private bool TryGetCharacterBounds(ushort characterId, out Rect bounds)
+        {
+            if (characterBoundsCache.TryGetValue(characterId, out bounds))
+                return bounds.width >= 0f;
+
+            // A sprite that (directly or indirectly) contains itself would otherwise
+            // recurse forever; treat the re-entry as contributing nothing.
+            if (!characterBoundsInProgress.Add(characterId))
+            {
+                bounds = EmptyCharacterBounds;
+                return false;
+            }
+
+            try
+            {
+                bounds = ComputeCharacterBounds(characterId);
+            }
+            finally
+            {
+                characterBoundsInProgress.Remove(characterId);
+            }
+
+            characterBoundsCache[characterId] = bounds;
+            return bounds.width >= 0f;
+        }
+
+        private Rect ComputeCharacterBounds(ushort characterId)
+        {
+            if (runtimeParser == null)
+                return EmptyCharacterBounds;
+
+            DefineShapeTag shape = runtimeParser.FindShapeById(characterId);
+
+            if (shape != null)
+            {
+                SwfRect r = shape.ShapeBounds;
+                return new Rect(
+                    r.XMinPixels,
+                    r.YMinPixels,
+                    Mathf.Max(0f, r.WidthPixels),
+                    Mathf.Max(0f, r.HeightPixels)
+                );
+            }
+
+            DefineTextTag text = runtimeParser.FindTextById(characterId);
+
+            if (text != null)
+            {
+                SwfRect r = text.TextBounds;
+                return new Rect(
+                    r.XMinPixels,
+                    r.YMinPixels,
+                    Mathf.Max(0f, r.WidthPixels),
+                    Mathf.Max(0f, r.HeightPixels)
+                );
+            }
+
+            DefineButton2Tag button = runtimeParser.FindButton2ById(characterId);
+
+            if (button != null)
+            {
+                Rect result = EmptyCharacterBounds;
+
+                for (int i = 0; i < button.Records.Count; i++)
+                {
+                    SwfButtonRecord record = button.Records[i];
+
+                    if (record == null || !record.StateUp)
+                        continue;
+
+                    if (TryGetCharacterBounds(record.CharacterId, out Rect child))
+                        result = UnionBounds(result, TransformBounds(child, record.Matrix));
+                }
+
+                return result;
+            }
+
+            DefineSpriteTag sprite = runtimeParser.FindSpriteById(characterId);
+
+            if (sprite?.Frames == null || sprite.Frames.Count == 0)
+                return EmptyCharacterBounds;
+
+            Rect spriteBounds = EmptyCharacterBounds;
+
+            for (int frame = 0; frame < sprite.Frames.Count; frame++)
+            {
+                List<PlaceObject2Tag> places =
+                    BuildDisplayListForFrame(runtimeParser, sprite.Frames, frame);
+
+                for (int i = 0; i < places.Count; i++)
+                {
+                    PlaceObject2Tag place = places[i];
+
+                    if (place == null || !place.HasCharacter || place.CharacterId == 0)
+                        continue;
+
+                    if (TryGetCharacterBounds(place.CharacterId, out Rect child))
+                        spriteBounds = UnionBounds(spriteBounds, TransformBounds(child, place.Matrix));
+                }
+            }
+
+            return spriteBounds;
+        }
+
+        // Axis-aligned bounds of the transformed corners; a rotated child therefore
+        // reports the extent of its rotated box, which is what Flash measures.
+        private static Rect TransformBounds(Rect local, SwfMatrix matrix)
+        {
+            Vector2 c0 = matrix.TransformPoint(local.xMin, local.yMin);
+            Vector2 c1 = matrix.TransformPoint(local.xMax, local.yMin);
+            Vector2 c2 = matrix.TransformPoint(local.xMax, local.yMax);
+            Vector2 c3 = matrix.TransformPoint(local.xMin, local.yMax);
+
+            float minX = Mathf.Min(Mathf.Min(c0.x, c1.x), Mathf.Min(c2.x, c3.x));
+            float maxX = Mathf.Max(Mathf.Max(c0.x, c1.x), Mathf.Max(c2.x, c3.x));
+            float minY = Mathf.Min(Mathf.Min(c0.y, c1.y), Mathf.Min(c2.y, c3.y));
+            float maxY = Mathf.Max(Mathf.Max(c0.y, c1.y), Mathf.Max(c2.y, c3.y));
+
+            return new Rect(minX, minY, maxX - minX, maxY - minY);
+        }
+
+        private static Rect UnionBounds(Rect a, Rect b)
+        {
+            if (a.width < 0f)
+                return b;
+
+            if (b.width < 0f)
+                return a;
+
+            float minX = Mathf.Min(a.xMin, b.xMin);
+            float minY = Mathf.Min(a.yMin, b.yMin);
+            float maxX = Mathf.Max(a.xMax, b.xMax);
+            float maxY = Mathf.Max(a.yMax, b.yMax);
+
+            return new Rect(minX, minY, maxX - minX, maxY - minY);
+        }
+
+        // _width/_height are the character's bounds scaled by the object's own
+        // _xscale/_yscale, i.e. its extent in the parent's coordinate space.
+        private object GetDisplayObjectComputedProperty(Avm1Object scriptObject, int propertyId)
+        {
+            if (scriptObject == null || !TryGetDisplayObjectCharacter(scriptObject, out ushort characterId))
+                return null;
+
+            if (!TryGetCharacterBounds(characterId, out Rect bounds))
+                return null;
+
+            if (propertyId == Avm1Runtime.ComputedPropertyWidth)
+            {
+                float scaleX = Avm1Float(scriptObject.Get("_xscale"), 100f) / 100f;
+                return (double)(bounds.width * Mathf.Abs(scaleX));
+            }
+
+            float scaleY = Avm1Float(scriptObject.Get("_yscale"), 100f) / 100f;
+            return (double)(bounds.height * Mathf.Abs(scaleY));
+        }
+
+        // Assigning _width/_height is a rescale: Flash converts the requested size into
+        // the scale factor that produces it, leaving the character's own geometry alone.
+        private bool SetDisplayObjectComputedProperty(
+            Avm1Object scriptObject,
+            int propertyId,
+            object value
+        )
+        {
+            if (scriptObject == null || !TryGetDisplayObjectCharacter(scriptObject, out ushort characterId))
+                return false;
+
+            if (!TryGetCharacterBounds(characterId, out Rect bounds))
+                return false;
+
+            float requested = Avm1Float(value, float.NaN);
+
+            if (float.IsNaN(requested) || requested < 0f)
+                return false;
+
+            bool isWidth = propertyId == Avm1Runtime.ComputedPropertyWidth;
+            float extent = isWidth ? bounds.width : bounds.height;
+
+            // A zero-extent character has no size to scale from, so Flash cannot
+            // satisfy the assignment either; report it rather than divide by zero.
+            if (extent <= 0.0001f)
+            {
+                if (verboseLogging)
+                {
+                    Debug.LogWarning(
+                        "Cannot set " + (isWidth ? "_width" : "_height") + " on character " +
+                        characterId + ": it has no measurable bounds."
+                    );
+                }
+
+                return false;
+            }
+
+            scriptObject.Set(isWidth ? "_xscale" : "_yscale", (double)(requested / extent * 100f));
+            return true;
+        }
+
+        private bool TryGetDisplayObjectCharacter(Avm1Object scriptObject, out ushort characterId)
+        {
+            object stored = scriptObject.Get("__characterId");
+
+            if (stored != null)
+            {
+                characterId = (ushort)Mathf.Clamp(Avm1Float(stored, 0f), 0f, ushort.MaxValue);
+                return characterId != 0;
+            }
+
+            characterId = 0;
+            return false;
         }
 
         private int GetCharacterFrameCount(ushort characterId)
@@ -2699,6 +3419,32 @@ namespace OpenSWFUnity.Runtime
             }
         }
 
+        private object HandleAvm2ExternalFunction(string functionName, IReadOnlyList<object> arguments)
+        {
+            if (string.IsNullOrEmpty(functionName))
+                return null;
+
+            if (verboseLogging)
+                Debug.Log("[AVM2] External function requested: " + functionName);
+
+            return null;
+        }
+
+        private object HandleAvm2ExternalMethod(
+            object receiver,
+            string functionName,
+            IReadOnlyList<object> arguments
+        )
+        {
+            if (string.IsNullOrEmpty(functionName))
+                return null;
+
+            if (verboseLogging)
+                Debug.Log("[AVM2] External method requested: " + functionName);
+
+            return null;
+        }
+
         private List<PlaceObject2Tag> BuildDisplayListForFrame(
             SwfParser parser,
             List<SwfFrame> frames,
@@ -2882,6 +3628,9 @@ namespace OpenSWFUnity.Runtime
             public int Depth;
             public int CurrentFrame;
             public bool IsPlaying;
+            public SwfMatrix TimelineMatrix;
+            public bool TimelineVisible;
+            public long LastSeenTimelineTick;
             public List<SwfClipActionRecord> ClipActions;
         }
 

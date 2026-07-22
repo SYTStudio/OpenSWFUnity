@@ -1,7 +1,8 @@
-using System;
+﻿using System;
 using System.IO;
 using System.IO.Compression;
 using System.Collections.Generic;
+using System.Text;
 using OpenSWFUnity.Runtime.Tags;
 using UnityEngine;
 
@@ -12,6 +13,11 @@ namespace OpenSWFUnity.Runtime.Parser
         private byte[] data;
         private int position;
         public bool VerboseLogging = false;
+
+        // Snapshotted when parsing begins so a quality change mid-parse cannot
+        // produce a shape library built at two different fidelities.
+        private int curveSubdivisionSteps =
+            Renderer.SwfRenderQuality.Settings.CurveSubdivisionSteps;
         public bool DiagnosticsLogging = true;
 
         public SwfHeader Header { get; private set; }
@@ -28,10 +34,28 @@ namespace OpenSWFUnity.Runtime.Parser
         public System.Collections.Generic.List<DefineFont3Tag> Fonts3 { get; private set; } = new System.Collections.Generic.List<DefineFont3Tag>();
         public List<DefineButton2Tag> Buttons2 { get; private set; } = new List<DefineButton2Tag>();
         public List<DefineSoundTag> Sounds { get; private set; } = new List<DefineSoundTag>();
+
+        // Streaming audio. The head declares the format once; the blocks arrive one
+        // per timeline frame, which is what allows the stream to be aligned with the
+        // playhead rather than merely started alongside it.
+        public SwfSoundStreamHead SoundStreamHead { get; private set; }
+        public List<SwfSoundStreamBlock> SoundStreamBlocks { get; private set; } =
+            new List<SwfSoundStreamBlock>();
+
+        // Formats encountered that this build cannot decode, reported once each.
+        public readonly HashSet<int> UnsupportedSoundFormats = new HashSet<int>();
         public Dictionary<string, ushort> ExportedAssets { get; private set; } = new Dictionary<string, ushort>();
         public List<SwfFrame> RootFrames { get; private set; } = new List<SwfFrame>();
+        public List<SwfInitAction> InitActions { get; private set; } = new List<SwfInitAction>();
+        public List<SwfDoAbcBlock> DoAbcBlocks { get; private set; } = new List<SwfDoAbcBlock>();
 
         public SetBackgroundColorTag BackgroundColor { get; private set; }
+
+        // ScriptLimits (tag 65). Present only when the movie ships the tag; the
+        // runtime uses these to raise (never lower) its safety guards.
+        public bool HasScriptLimits { get; private set; }
+        public ushort ScriptMaxRecursionDepth { get; private set; }
+        public ushort ScriptTimeoutSeconds { get; private set; }
 
 
         public int DefineFontCount;
@@ -424,6 +448,10 @@ namespace OpenSWFUnity.Runtime.Parser
             if (Header == null)
                 ParseHeader();
 
+            curveSubdivisionSteps =
+                System.Math.Max(1, Renderer.SwfRenderQuality.Settings.CurveSubdivisionSteps);
+            Renderer.SwfRenderQuality.MarkParsed();
+
             Tags.Clear();
             RootFrames.Clear();
 
@@ -540,6 +568,31 @@ namespace OpenSWFUnity.Runtime.Parser
                 }
             }
 
+            if (tag.Code == 65 && tag.Length >= 4) // ScriptLimits
+            {
+                HasScriptLimits = true;
+                ScriptMaxRecursionDepth = ReadUInt16LEAt(tag.DataStart);
+                ScriptTimeoutSeconds = ReadUInt16LEAt(tag.DataStart + 2);
+
+                if (VerboseLogging)
+                {
+                    Debug.Log(
+                        "ScriptLimits MaxRecursionDepth=" + ScriptMaxRecursionDepth +
+                        " ScriptTimeoutSeconds=" + ScriptTimeoutSeconds
+                    );
+                }
+            }
+
+            if (tag.Code == 59)
+            {
+                ParseDoInitAction(tag);
+            }
+
+            if (tag.Code == 82)
+            {
+                ParseDoAbc(tag);
+            }
+
             if (tag.Code == 2 || tag.Code == 22 || tag.Code == 32 || tag.Code == 83)
             {
                 ParseDefineShape(tag);
@@ -578,6 +631,16 @@ namespace OpenSWFUnity.Runtime.Parser
             if (tag.Code == 14)
             {
                 ParseDefineSound(tag);
+            }
+
+            if (tag.Code == 18 || tag.Code == 45)
+            {
+                ParseSoundStreamHead(tag);
+            }
+
+            if (tag.Code == 19)
+            {
+                ParseSoundStreamBlock(tag);
             }
 
             if (tag.Code == 56)
@@ -839,6 +902,73 @@ namespace OpenSWFUnity.Runtime.Parser
             }
         }
 
+        private void ParseDoInitAction(SwfTag tag)
+        {
+            if (tag == null || tag.Length < 2)
+                return;
+
+            ushort spriteId = ReadUInt16LEAt(tag.DataStart);
+            byte[] actionBytes = CopyTagData(tag, 2);
+            InitActions.Add(new SwfInitAction
+            {
+                SpriteId = spriteId,
+                ActionBytes = actionBytes
+            });
+
+            if (VerboseLogging)
+            {
+                Debug.Log("Parsed DoInitAction for SpriteId=" + spriteId + " Actions=" + actionBytes.Length);
+            }
+        }
+
+        private void ParseDoAbc(SwfTag tag)
+        {
+            if (tag == null || tag.Length < 4)
+                return;
+
+            uint flags = ReadUInt32LE(tag.DataStart);
+            int p = tag.DataStart + 4;
+            int tagEnd = tag.DataStart + tag.Length;
+            int nameStart = p;
+
+            while (p < tagEnd && data[p] != 0)
+                p++;
+
+            string name = string.Empty;
+
+            if (p > nameStart)
+            {
+                name = Encoding.UTF8.GetString(data, nameStart, p - nameStart);
+            }
+
+            if (p < tagEnd)
+                p++;
+
+            int abcLength = Math.Max(0, tagEnd - p);
+            byte[] abcData = new byte[abcLength];
+            Array.Copy(data, p, abcData, 0, abcLength);
+
+            DoAbcBlocks.Add(new SwfDoAbcBlock
+            {
+                Flags = flags,
+                Name = name,
+                AbcData = abcData
+            });
+
+            if (DiagnosticsLogging)
+            {
+                // The block itself is extracted here and parsed by the AVM2 layer;
+                // what remains unimplemented is executing the AS3 it contains, which
+                // the AVM2 runtime reports once rather than once per block.
+                Debug.Log(
+                    "Found DoABC block: " +
+                    (string.IsNullOrEmpty(name) ? "<anonymous>" : name) +
+                    " Flags=0x" + flags.ToString("X8") +
+                    " Size=" + abcLength
+                );
+            }
+        }
+
         private void ParseDefineButton2(SwfTag tag)
         {
             try
@@ -955,6 +1085,150 @@ namespace OpenSWFUnity.Runtime.Parser
             }
         }
 
+        // SoundStreamHead (18) and SoundStreamHead2 (45) share a layout; the second
+        // form simply allows the stream format to differ from the playback format.
+        private void ParseSoundStreamHead(SwfTag tag)
+        {
+            try
+            {
+                int p = tag.DataStart;
+                byte playbackFlags = data[p++];
+                byte streamFlags = data[p++];
+
+                SwfSoundStreamHead head = new SwfSoundStreamHead
+                {
+                    PlaybackSampleRate = GetSoundSampleRate((playbackFlags >> 2) & 0x03),
+                    PlaybackIs16Bit = (playbackFlags & 0x02) != 0,
+                    PlaybackIsStereo = (playbackFlags & 0x01) != 0,
+                    StreamFormat = (streamFlags >> 4) & 0x0F,
+                    StreamSampleRate = GetSoundSampleRate((streamFlags >> 2) & 0x03),
+                    StreamIs16Bit = (streamFlags & 0x02) != 0,
+                    StreamIsStereo = (streamFlags & 0x01) != 0,
+                    SamplesPerFrame = ReadUInt16LEAt(p)
+                };
+
+                p += 2;
+
+                // Only the MP3 form carries a latency seek value.
+                if (head.StreamFormat == 2 && p + 2 <= tag.DataStart + tag.Length)
+                    head.LatencySeek = (short)ReadUInt16LEAt(p);
+
+                // A head with no samples per frame declares "no stream follows", which
+                // authoring tools emit routinely; keep the first real one.
+                if (head.SamplesPerFrame == 0 && SoundStreamHead != null)
+                    return;
+
+                SoundStreamHead = head;
+
+                if (!Audio.SwfSoundFormats.IsSupported(head.StreamFormat))
+                    UnsupportedSoundFormats.Add(head.StreamFormat);
+
+                if (VerboseLogging)
+                    Debug.Log(head.ToString());
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse SoundStreamHead: " + e.Message);
+            }
+        }
+
+        private void ParseSoundStreamBlock(SwfTag tag)
+        {
+            try
+            {
+                int p = tag.DataStart;
+                int end = tag.DataStart + tag.Length;
+                SwfSoundStreamBlock block = new SwfSoundStreamBlock
+                {
+                    FrameIndex = RootFrames.Count
+                };
+
+                // MP3 blocks prefix the frames with a sample count and a seek offset.
+                if (SoundStreamHead != null && SoundStreamHead.StreamFormat == 2 && p + 4 <= end)
+                {
+                    block.SampleCount = ReadUInt16LEAt(p);
+                    p += 2;
+                    block.SeekSamples = (short)ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                int length = Math.Max(0, end - p);
+
+                if (length == 0)
+                    return;
+
+                block.Data = new byte[length];
+                Array.Copy(data, p, block.Data, 0, length);
+                SoundStreamBlocks.Add(block);
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse SoundStreamBlock: " + e.Message);
+            }
+        }
+
+        // SOUNDINFO follows the sound id in a StartSound tag and controls how that
+        // sound is played back.
+        public SwfSoundInfo ParseSoundInfo(byte[] payload, int offset, out int afterOffset)
+        {
+            afterOffset = offset;
+
+            if (payload == null || offset >= payload.Length)
+                return null;
+
+            byte flags = payload[offset++];
+            SwfSoundInfo info = new SwfSoundInfo
+            {
+                SyncStop = (flags & 0x20) != 0,
+                SyncNoMultiple = (flags & 0x10) != 0,
+                HasEnvelope = (flags & 0x08) != 0,
+                HasLoops = (flags & 0x04) != 0,
+                HasOutPoint = (flags & 0x02) != 0,
+                HasInPoint = (flags & 0x01) != 0
+            };
+
+            if (info.HasInPoint && offset + 4 <= payload.Length)
+            {
+                info.InPoint = BitConverter.ToUInt32(payload, offset);
+                offset += 4;
+            }
+
+            if (info.HasOutPoint && offset + 4 <= payload.Length)
+            {
+                info.OutPoint = BitConverter.ToUInt32(payload, offset);
+                offset += 4;
+            }
+
+            if (info.HasLoops && offset + 2 <= payload.Length)
+            {
+                info.LoopCount = (ushort)(payload[offset] | (payload[offset + 1] << 8));
+                offset += 2;
+            }
+
+            if (info.HasEnvelope && offset < payload.Length)
+            {
+                int points = payload[offset++];
+                info.Envelope = new List<SwfSoundEnvelopePoint>(points);
+
+                for (int i = 0; i < points && offset + 8 <= payload.Length; i++)
+                {
+                    info.Envelope.Add(new SwfSoundEnvelopePoint
+                    {
+                        Position44 = BitConverter.ToUInt32(payload, offset),
+                        LeftLevel = (ushort)(payload[offset + 4] | (payload[offset + 5] << 8)),
+                        RightLevel = (ushort)(payload[offset + 6] | (payload[offset + 7] << 8))
+                    });
+
+                    offset += 8;
+                }
+            }
+
+            afterOffset = offset;
+            return info;
+        }
+
         private void ParseDefineSound(SwfTag tag)
         {
             try
@@ -992,6 +1266,9 @@ namespace OpenSWFUnity.Runtime.Parser
                 Array.Copy(data, p, sound.SoundData, 0, soundDataLength);
 
                 Sounds.Add(sound);
+
+                if (!Audio.SwfSoundFormats.IsSupported(sound.SoundFormat))
+                    UnsupportedSoundFormats.Add(sound.SoundFormat);
 
                 if (VerboseLogging)
                     Debug.Log(sound.ToString());
@@ -1232,48 +1509,64 @@ namespace OpenSWFUnity.Runtime.Parser
             }
         }
 
+        // Character lookups run once per placed object per rendered frame, so the
+        // original linear scans were O(placedObjects * charactersOfThatType) every
+        // frame. The dictionaries are built lazily on first lookup (all parsing has
+        // finished by the time anything renders) and never change afterwards, so a
+        // single index build replaces the repeated scans without touching parsing.
+        private Dictionary<ushort, DefineShapeTag> shapeIndex;
+        private Dictionary<ushort, DefineSpriteTag> spriteIndex;
+        private Dictionary<ushort, DefineButton2Tag> button2Index;
+        private Dictionary<ushort, DefineSoundTag> soundIndex;
+        private Dictionary<ushort, DefineTextTag> textIndex;
+        private Dictionary<ushort, DefineFont3Tag> font3Index;
+
         public DefineShapeTag FindShapeById(ushort id)
         {
-            for (int i = 0; i < Shapes.Count; i++)
+            if (shapeIndex == null)
             {
-                if (Shapes[i].CharacterId == id)
-                    return Shapes[i];
+                shapeIndex = new Dictionary<ushort, DefineShapeTag>(Shapes.Count);
+                for (int i = 0; i < Shapes.Count; i++)
+                    shapeIndex[Shapes[i].CharacterId] = Shapes[i];
             }
 
-            return null;
+            return shapeIndex.TryGetValue(id, out DefineShapeTag shape) ? shape : null;
         }
 
         public DefineSpriteTag FindSpriteById(ushort id)
         {
-            for (int i = 0; i < Sprites.Count; i++)
+            if (spriteIndex == null)
             {
-                if (Sprites[i].SpriteId == id)
-                    return Sprites[i];
+                spriteIndex = new Dictionary<ushort, DefineSpriteTag>(Sprites.Count);
+                for (int i = 0; i < Sprites.Count; i++)
+                    spriteIndex[Sprites[i].SpriteId] = Sprites[i];
             }
 
-            return null;
+            return spriteIndex.TryGetValue(id, out DefineSpriteTag sprite) ? sprite : null;
         }
 
         public DefineButton2Tag FindButton2ById(ushort id)
         {
-            for (int i = 0; i < Buttons2.Count; i++)
+            if (button2Index == null)
             {
-                if (Buttons2[i].ButtonId == id)
-                    return Buttons2[i];
+                button2Index = new Dictionary<ushort, DefineButton2Tag>(Buttons2.Count);
+                for (int i = 0; i < Buttons2.Count; i++)
+                    button2Index[Buttons2[i].ButtonId] = Buttons2[i];
             }
 
-            return null;
+            return button2Index.TryGetValue(id, out DefineButton2Tag button) ? button : null;
         }
 
         public DefineSoundTag FindSoundById(ushort id)
         {
-            for (int i = 0; i < Sounds.Count; i++)
+            if (soundIndex == null)
             {
-                if (Sounds[i].SoundId == id)
-                    return Sounds[i];
+                soundIndex = new Dictionary<ushort, DefineSoundTag>(Sounds.Count);
+                for (int i = 0; i < Sounds.Count; i++)
+                    soundIndex[Sounds[i].SoundId] = Sounds[i];
             }
 
-            return null;
+            return soundIndex.TryGetValue(id, out DefineSoundTag sound) ? sound : null;
         }
 
         public DefineSoundTag FindExportedSound(string exportName)
@@ -1298,6 +1591,14 @@ namespace OpenSWFUnity.Runtime.Parser
             byte[] result = new byte[length];
             Array.Copy(data, start, result, 0, length);
             return result;
+        }
+
+        public ushort ParseDoInitActionSpriteId(SwfTag tag)
+        {
+            if (tag == null || tag.Length < 2)
+                return 0;
+
+            return ReadUInt16LEAt(tag.DataStart);
         }
 
         private byte ReadByteAt(int offset)
@@ -1994,17 +2295,11 @@ namespace OpenSWFUnity.Runtime.Parser
                         int endX = currentX + dx;
                         int endY = currentY + dy;
 
-                        AddShapeEdge(
-                            shapeData,
-                            startX,
-                            startY,
-                            endX,
-                            endY,
-                            currentPath.FillStyle0,
-                            currentPath.FillStyle1,
-                            currentPath.LineStyle
-                        );
-
+                        // The edge list is rebuilt from these path points by
+                        // BuildEdgesFromPaths, so appending the point is the only
+                        // thing needed here. Emitting an edge as well allocated every
+                        // edge in the movie twice, and the first copy was then thrown
+                        // away by Edges.Clear().
                         currentX = endX;
                         currentY = endY;
 
@@ -2047,8 +2342,11 @@ namespace OpenSWFUnity.Runtime.Parser
                         int anchorX = controlX + anchorDeltaX;
                         int anchorY = controlY + anchorDeltaY;
 
-                        // Quadratic Bezier sampling
-                        const int steps = 8;
+                        // Quadratic Bezier sampling. The segment count comes from the
+                        // active quality level: this is where curve fidelity is fixed
+                        // for the life of the loaded movie, because the flattened
+                        // points are what every later stage consumes.
+                        int steps = curveSubdivisionSteps;
 
                         Vector2 previousPoint = new Vector2(startX / 20f, startY / 20f);
 
@@ -2068,17 +2366,6 @@ namespace OpenSWFUnity.Runtime.Parser
                                 t * t * anchorY;
 
                             Vector2 sampledPoint = new Vector2(x / 20f, y / 20f);
-
-                            SwfShapeEdge edge = new SwfShapeEdge
-                            {
-                                Start = previousPoint,
-                                End = sampledPoint,
-                                FillStyle0 = currentPath.FillStyle0,
-                                FillStyle1 = currentPath.FillStyle1,
-                                LineStyle = currentPath.LineStyle
-                            };
-
-                            shapeData.Edges.Add(edge);
 
                             currentPath.Points.Add(sampledPoint);
                             previousPoint = sampledPoint;
@@ -2122,35 +2409,13 @@ namespace OpenSWFUnity.Runtime.Parser
             return currentPath;
         }
 
-        private void AddShapeEdge(
-            SwfShapeData shapeData,
-            int startX,
-            int startY,
-            int endX,
-            int endY,
-            int fillStyle0,
-            int fillStyle1,
-            int lineStyle
-        )
-        {
-            SwfShapeEdge edge = new SwfShapeEdge
-            {
-                Start = new Vector2(startX / 20f, startY / 20f),
-                End = new Vector2(endX / 20f, endY / 20f),
-                FillStyle0 = fillStyle0,
-                FillStyle1 = fillStyle1,
-                LineStyle = lineStyle
-            };
-
-            shapeData.Edges.Add(edge);
-        }
-
         private void BuildFillEdgeGroups(SwfShapeData shapeData)
         {
             if (shapeData == null || shapeData.Edges == null)
                 return;
 
             shapeData.FillEdgeGroups.Clear();
+            fillGroupIndex.Clear();
 
             for (int i = 0; i < shapeData.Edges.Count; i++)
             {
@@ -2166,12 +2431,14 @@ namespace OpenSWFUnity.Runtime.Parser
                 // We store it too, but reversed, because FillStyle0 represents the other side of the edge.
                 if (edge.FillStyle0 > 0)
                 {
+                    // Reversing the direction swaps which side each fill is on, so
+                    // the two style fields swap with it.
                     SwfShapeEdge reversed = new SwfShapeEdge
                     {
                         Start = edge.End,
                         End = edge.Start,
-                        FillStyle0 = edge.FillStyle0,
-                        FillStyle1 = edge.FillStyle1,
+                        FillStyle0 = edge.FillStyle1,
+                        FillStyle1 = edge.FillStyle0,
                         LineStyle = edge.LineStyle
                     };
 
@@ -2188,24 +2455,18 @@ namespace OpenSWFUnity.Runtime.Parser
             }
         }
 
+        // Scratch index reused across shapes so grouping does not allocate a
+        // dictionary per shape.
+        private readonly Dictionary<int, SwfFillEdgeGroup> fillGroupIndex =
+            new Dictionary<int, SwfFillEdgeGroup>();
+
         private void AddEdgeToFillGroup(
             SwfShapeData shapeData,
             int fillStyleIndex,
             SwfShapeEdge edge
         )
         {
-            SwfFillEdgeGroup group = null;
-
-            for (int i = 0; i < shapeData.FillEdgeGroups.Count; i++)
-            {
-                if (shapeData.FillEdgeGroups[i].FillStyleIndex == fillStyleIndex)
-                {
-                    group = shapeData.FillEdgeGroups[i];
-                    break;
-                }
-            }
-
-            if (group == null)
+            if (!fillGroupIndex.TryGetValue(fillStyleIndex, out SwfFillEdgeGroup group))
             {
                 group = new SwfFillEdgeGroup
                 {
@@ -2213,6 +2474,7 @@ namespace OpenSWFUnity.Runtime.Parser
                 };
 
                 shapeData.FillEdgeGroups.Add(group);
+                fillGroupIndex[fillStyleIndex] = group;
             }
 
             group.Edges.Add(edge);
@@ -2224,6 +2486,22 @@ namespace OpenSWFUnity.Runtime.Parser
                 return;
 
             shapeData.Edges.Clear();
+
+            // One edge per point gap across every path. Sizing up front avoids the
+            // repeated reallocation that dominated parse-time allocation on large
+            // vector content.
+            int expectedEdges = 0;
+
+            for (int p = 0; p < shapeData.Paths.Count; p++)
+            {
+                SwfShapePath path = shapeData.Paths[p];
+
+                if (path?.Points != null && path.Points.Count >= 2)
+                    expectedEdges += path.Points.Count - 1;
+            }
+
+            if (shapeData.Edges.Capacity < expectedEdges)
+                shapeData.Edges.Capacity = expectedEdges;
 
             for (int p = 0; p < shapeData.Paths.Count; p++)
             {
@@ -2258,7 +2536,21 @@ namespace OpenSWFUnity.Runtime.Parser
                 SwfFillEdgeGroup group = shapeData.FillEdgeGroups[g];
 
                 group.Contours.Clear();
-                StitchDirectedEdges(group);
+                int contoursBefore = group.Contours.Count;
+                StitchDirectedEdges(shapeData, group);
+
+                // A group that carried edges but yielded no closed loop draws
+                // nothing at all. That is a real hole in the output, so it is
+                // reported rather than dropped without trace.
+                if (group.Contours.Count == contoursBefore && group.Edges.Count > 0)
+                {
+                    Renderer.SwfRenderDiagnostics.Report(
+                        Renderer.SwfRenderProblem.DegenerateGeometry,
+                        shapeData.CharacterId,
+                        group.FillStyleIndex,
+                        "fill group " + group.FillStyleIndex + " has " + group.Edges.Count +
+                        " edges but produced no closed contour; nothing is drawn for it");
+                }
                 MarkHoleCandidates(group);
             }
         }
@@ -2269,35 +2561,34 @@ namespace OpenSWFUnity.Runtime.Parser
         // so forward-only traversal preserves the winding: outer boundaries and
         // holes come out with opposite orientation, exactly like Flash. The old
         // code matched either endpoint, which flipped edges and scrambled shapes.
-        private void StitchDirectedEdges(SwfFillEdgeGroup group)
+        private void StitchDirectedEdges(SwfShapeData shapeData, SwfFillEdgeGroup group)
         {
             if (group == null || group.Edges == null || group.Edges.Count == 0)
                 return;
 
-            Dictionary<long, List<SwfShapeEdge>> byStartCell =
-                new Dictionary<long, List<SwfShapeEdge>>();
+            // Edges are addressed by index throughout: a struct edge has no identity
+            // to hash, and an index-keyed bucket avoids the per-edge hashing the
+            // previous HashSet<SwfShapeEdge> performed on every lookup.
+            Dictionary<long, List<int>> byStartCell = new Dictionary<long, List<int>>();
 
             for (int i = 0; i < group.Edges.Count; i++)
             {
-                SwfShapeEdge edge = group.Edges[i];
-                long key = PointCellKey(edge.Start);
+                long key = PointCellKey(group.Edges[i].Start);
 
-                if (!byStartCell.TryGetValue(key, out List<SwfShapeEdge> bucket))
+                if (!byStartCell.TryGetValue(key, out List<int> bucket))
                 {
-                    bucket = new List<SwfShapeEdge>();
+                    bucket = new List<int>();
                     byStartCell[key] = bucket;
                 }
 
-                bucket.Add(edge);
+                bucket.Add(i);
             }
 
-            HashSet<SwfShapeEdge> used = new HashSet<SwfShapeEdge>();
+            bool[] used = new bool[group.Edges.Count];
 
             for (int i = 0; i < group.Edges.Count; i++)
             {
-                SwfShapeEdge startEdge = group.Edges[i];
-
-                if (used.Contains(startEdge))
+                if (used[i])
                     continue;
 
                 SwfFillContour contour = new SwfFillContour
@@ -2305,32 +2596,51 @@ namespace OpenSWFUnity.Runtime.Parser
                     FillStyleIndex = group.FillStyleIndex
                 };
 
-                SwfShapeEdge current = startEdge;
-                Vector2 loopStart = current.Start;
-                contour.Points.Add(current.Start);
+                int current = i;
+                Vector2 loopStart = group.Edges[current].Start;
+                contour.Points.Add(loopStart);
 
                 int guard = 0;
                 int maxGuard = group.Edges.Count + 4;
 
-                while (current != null && guard++ < maxGuard)
+                while (current >= 0 && guard++ < maxGuard)
                 {
-                    used.Add(current);
-                    contour.Points.Add(current.End);
+                    used[current] = true;
+                    Vector2 tip = group.Edges[current].End;
+                    contour.Points.Add(tip);
 
-                    if (PointsClose(current.End, loopStart))
+                    if (PointsClose(tip, loopStart))
                         break; // loop closed cleanly
 
-                    current = TakeNextForwardEdge(byStartCell, used, current.End);
+                    current = TakeNextForwardEdge(group, byStartCell, used, tip);
                 }
 
                 if (contour.Points.Count >= 3)
+                {
+                    // A contour whose last point is far from its first could not
+                    // be stitched into a closed loop, which means the source edges
+                    // have a gap. It is still filled, but the seam is reported.
+                    if (!PointsClose(contour.Points[contour.Points.Count - 1], loopStart))
+                    {
+                        Renderer.SwfRenderDiagnostics.Report(
+                            Renderer.SwfRenderProblem.DisconnectedPath,
+                            shapeData.CharacterId,
+                            group.FillStyleIndex,
+                            "fill group " + group.FillStyleIndex +
+                            " produced an unclosed contour of " + contour.Points.Count +
+                            " points; the outline has a gap");
+                    }
+
                     group.Contours.Add(contour);
+                }
             }
         }
 
-        private SwfShapeEdge TakeNextForwardEdge(
-            Dictionary<long, List<SwfShapeEdge>> byStartCell,
-            HashSet<SwfShapeEdge> used,
+        // Returns the index of the next unused edge starting at the tip, or -1.
+        private int TakeNextForwardEdge(
+            SwfFillEdgeGroup group,
+            Dictionary<long, List<int>> byStartCell,
+            bool[] used,
             Vector2 tip
         )
         {
@@ -2345,20 +2655,20 @@ namespace OpenSWFUnity.Runtime.Parser
                 {
                     long key = CellKey(baseX + ox, baseY + oy);
 
-                    if (!byStartCell.TryGetValue(key, out List<SwfShapeEdge> bucket))
+                    if (!byStartCell.TryGetValue(key, out List<int> bucket))
                         continue;
 
                     for (int i = 0; i < bucket.Count; i++)
                     {
-                        SwfShapeEdge candidate = bucket[i];
+                        int candidate = bucket[i];
 
-                        if (!used.Contains(candidate) && PointsClose(candidate.Start, tip))
+                        if (!used[candidate] && PointsClose(group.Edges[candidate].Start, tip))
                             return candidate;
                     }
                 }
             }
 
-            return null;
+            return -1;
         }
 
         // Vertex-welding grid for edge stitching. Matches the PointsClose radius so
@@ -2720,13 +3030,14 @@ namespace OpenSWFUnity.Runtime.Parser
 
         public DefineFont3Tag FindFont3ById(ushort fontId)
         {
-            for (int i = 0; i < Fonts3.Count; i++)
+            if (font3Index == null)
             {
-                if (Fonts3[i].FontId == fontId)
-                    return Fonts3[i];
+                font3Index = new Dictionary<ushort, DefineFont3Tag>(Fonts3.Count);
+                for (int i = 0; i < Fonts3.Count; i++)
+                    font3Index[Fonts3[i].FontId] = Fonts3[i];
             }
 
-            return null;
+            return font3Index.TryGetValue(fontId, out DefineFont3Tag font) ? font : null;
         }
 
         private string DecodeTextRecord(SwfTextRecord record)
@@ -2768,13 +3079,14 @@ namespace OpenSWFUnity.Runtime.Parser
 
         public DefineTextTag FindTextById(ushort id)
         {
-            for (int i = 0; i < Texts.Count; i++)
+            if (textIndex == null)
             {
-                if (Texts[i].CharacterId == id)
-                    return Texts[i];
+                textIndex = new Dictionary<ushort, DefineTextTag>(Texts.Count);
+                for (int i = 0; i < Texts.Count; i++)
+                    textIndex[Texts[i].CharacterId] = Texts[i];
             }
 
-            return null;
+            return textIndex.TryGetValue(id, out DefineTextTag text) ? text : null;
         }
 
         public string DecodeTextRecordPublic(SwfTextRecord record)

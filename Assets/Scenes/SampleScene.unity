@@ -169,6 +169,7 @@ MonoBehaviour:
   usePlacedObjectLocalAge: 1
   inputEnabled: 1
   enableAvm1: 1
+  enableAvm2: 1
 --- !u!4 &477384985
 Transform:
   m_ObjectHideFlags: 0

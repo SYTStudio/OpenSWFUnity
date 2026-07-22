@@ -1,18 +1,19 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
+using OpenSWFUnity.Runtime.Script;
 using UnityEngine;
 
 namespace OpenSWFUnity.Runtime.AVM1
 {
-    public sealed class Avm1Runtime
+    public sealed class Avm1Runtime : ISwfScriptRuntime
     {
         // A real game's initialisation script legitimately runs far more than a
         // demo's: 200k was low enough that Isaac-sized content tripped the guard
         // during startup and silently stopped half-configured. Still bounded, so
         // a genuinely runaway script cannot hang the Editor.
-        private const int DefaultInstructionBudget = 5000000;
+        public const int DefaultInstructionBudget = 5000000;
         private static readonly object Undefined = new object();
 
         private readonly StringComparer nameComparer;
@@ -28,6 +29,38 @@ namespace OpenSWFUnity.Runtime.AVM1
         public Action<string> Warning { get; set; }
         public int DefinedFunctionCount { get; private set; }
         public bool VerboseLogging { get; set; }
+
+        // Per-Execute instruction ceiling. Defaults to the safety cap above and is
+        // only ever raised (never lowered) by a movie's ScriptLimits tag, so wiring
+        // it up cannot make currently-working content trip the guard sooner.
+        public int InstructionBudget { get; set; } = DefaultInstructionBudget;
+
+        // Flash aborts a script once calls nest deeper than this. The guard matters
+        // more here than in Flash: unbounded C# recursion raises StackOverflowException,
+        // which .NET cannot catch, so a self-recursive AS function would take down the
+        // whole player process instead of just stopping the script.
+        public const int DefaultMaxCallDepth = 256;
+        public int MaxCallDepth { get; set; } = DefaultMaxCallDepth;
+
+        // Instructions remaining for the currently running top-level execution. Kept
+        // as runtime state rather than a per-call local so that nested calls draw from
+        // one shared allowance; a fresh budget per call let `function f(){ f(); }` run
+        // forever, because every level restarted the count.
+        private int remainingInstructions;
+        private int executionDepth;
+        private int callDepth;
+        private bool budgetExhaustedReported;
+
+        // Unsupported and malformed instructions must be visible without drowning the
+        // console: a script on a 30 fps timeline would otherwise log the same opcode
+        // thousands of times a minute. Each distinct problem is reported once and then
+        // only counted, with the totals exposed for diagnostics and tests.
+        private readonly Dictionary<byte, int> unsupportedOpcodeCounts = new Dictionary<byte, int>();
+        private readonly HashSet<byte> reportedUnsupportedOpcodes = new HashSet<byte>();
+
+        public IReadOnlyDictionary<byte, int> UnsupportedOpcodeCounts => unsupportedOpcodeCounts;
+        public int MalformedInstructionCount { get; private set; }
+        public int AbortedCallCount { get; private set; }
 
         public Avm1Runtime(bool caseSensitive = true)
         {
@@ -126,21 +159,78 @@ namespace OpenSWFUnity.Runtime.AVM1
                 {
                     ["this"] = thisObject ?? RootObject
                 };
-            ExecutionContext context = new ExecutionContext(locals, new List<string>(), false);
+            ExecutionContext context = RentContext(locals, null, false);
             context.Target = thisObject ?? RootObject;
             context.OriginalTarget = context.Target;
-            int budget = DefaultInstructionBudget;
+
+            BeginExecution();
 
             try
             {
-                ExecuteBlock(actionBytes, 0, actionBytes.Length, context, ref budget);
+                ExecuteBlock(actionBytes, 0, actionBytes.Length, context);
             }
             catch (Avm1ThrownException thrown)
             {
                 ReportWarning("Uncaught AVM1 exception: " + ToAvm1String(thrown.Value));
             }
+            finally
+            {
+                EndExecution();
+            }
 
-            return context.ReturnValue;
+            object returnValue = context.ReturnValue;
+            ReturnContext(context);
+            return returnValue;
+        }
+
+        // Bounded so a deep one-off call chain cannot leave a large pool resident. Any
+        // excess context is simply dropped to the collector instead of being retained.
+        private const int MaxPooledContexts = 64;
+        private readonly Stack<ExecutionContext> contextPool = new Stack<ExecutionContext>();
+
+        private ExecutionContext RentContext(
+            Dictionary<string, object> locals,
+            List<string> constantPoolSource,
+            bool isFunction
+        )
+        {
+            ExecutionContext context = contextPool.Count > 0
+                ? contextPool.Pop()
+                : new ExecutionContext();
+
+            context.Initialize(locals, constantPoolSource, isFunction);
+            return context;
+        }
+
+        private void ReturnContext(ExecutionContext context)
+        {
+            if (context == null || contextPool.Count >= MaxPooledContexts)
+                return;
+
+            context.Reset();
+            contextPool.Push(context);
+        }
+
+        // A top-level entry point refreshes the instruction allowance; a re-entrant one
+        // (an external method calling back into script mid-execution) must not, or the
+        // callback would hand a runaway script an unlimited extension.
+        private void BeginExecution()
+        {
+            if (executionDepth == 0)
+            {
+                remainingInstructions = InstructionBudget > 0
+                    ? InstructionBudget
+                    : DefaultInstructionBudget;
+                budgetExhaustedReported = false;
+            }
+
+            executionDepth++;
+        }
+
+        private void EndExecution()
+        {
+            if (executionDepth > 0)
+                executionDepth--;
         }
 
         public bool TryCallFunction(string functionName, IReadOnlyList<object> arguments, out object result)
@@ -190,12 +280,62 @@ namespace OpenSWFUnity.Runtime.AVM1
             SetVariable(null, name, value);
         }
 
+        object ISwfScriptRuntime.RootObject => RootObject;
+
+        object ISwfScriptRuntime.CreateObject()
+        {
+            return CreateObject();
+        }
+
+        bool ISwfScriptRuntime.ApplyRegisteredClass(string linkageName, object instance)
+        {
+            return ApplyRegisteredClass(linkageName, instance as Avm1Object);
+        }
+
+        void ISwfScriptRuntime.RegisterFunctions(byte[] actionBytes)
+        {
+            RegisterFunctions(actionBytes);
+        }
+
+        object ISwfScriptRuntime.Execute(byte[] actionBytes, object thisObject)
+        {
+            return Execute(actionBytes, thisObject as Avm1Object);
+        }
+
+        bool ISwfScriptRuntime.TryCallFunction(
+            string functionName,
+            IReadOnlyList<object> arguments,
+            out object result
+        )
+        {
+            return TryCallFunction(functionName, arguments, out result);
+        }
+
+        bool ISwfScriptRuntime.TryCallMethod(
+            object receiver,
+            string methodName,
+            IReadOnlyList<object> arguments,
+            out object result
+        )
+        {
+            return TryCallMethod(receiver as Avm1Object, methodName, arguments, out result);
+        }
+
+        object ISwfScriptRuntime.GetVariable(string name)
+        {
+            return GetVariable(name);
+        }
+
+        void ISwfScriptRuntime.SetVariable(string name, object value)
+        {
+            SetVariable(name, value);
+        }
+
         private void ExecuteBlock(
             byte[] code,
             int start,
             int end,
-            ExecutionContext context,
-            ref int instructionBudget
+            ExecutionContext context
         )
         {
             int p = Math.Max(0, start);
@@ -203,9 +343,19 @@ namespace OpenSWFUnity.Runtime.AVM1
 
             while (p < end && !context.Returned)
             {
-                if (--instructionBudget < 0)
+                if (--remainingInstructions < 0)
                 {
-                    ReportWarning("AVM1 instruction budget reached; script execution was stopped safely.");
+                    if (!budgetExhaustedReported)
+                    {
+                        budgetExhaustedReported = true;
+                        ReportWarning(
+                            "AVM1 instruction budget of " +
+                            (InstructionBudget > 0 ? InstructionBudget : DefaultInstructionBudget) +
+                            " reached; script execution was stopped safely. The movie may be " +
+                            "stuck in an infinite loop, or may need a higher ScriptLimits budget."
+                        );
+                    }
+
                     return;
                 }
 
@@ -220,7 +370,10 @@ namespace OpenSWFUnity.Runtime.AVM1
                 if (opcode >= 0x80)
                 {
                     if (p + 2 > end)
+                    {
+                        ReportMalformedInstruction(opcode, actionStart, "length prefix is truncated");
                         return;
+                    }
 
                     payloadLength = ReadUInt16(code, p);
                     p += 2;
@@ -228,6 +381,19 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                 int payloadStart = p;
                 int payloadEnd = Math.Min(end, payloadStart + payloadLength);
+
+                // A payload that runs past the end of its block means the action data was
+                // truncated or mis-sized. Execution continues against the clamped payload
+                // (matching how Flash tolerates damaged tags) but the fault is recorded.
+                if (payloadStart + payloadLength > end)
+                {
+                    ReportMalformedInstruction(
+                        opcode,
+                        actionStart,
+                        "payload of " + payloadLength + " bytes overruns the action block by " +
+                        (payloadStart + payloadLength - end) + " bytes"
+                    );
+                }
 
                 try
                 {
@@ -690,8 +856,7 @@ namespace OpenSWFUnity.Runtime.AVM1
                                 code,
                                 payloadStart,
                                 payloadEnd,
-                                context,
-                                ref instructionBudget
+                                context
                             );
                             p = payloadEnd;
                             continue;
@@ -712,7 +877,7 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                                 try
                                 {
-                                    ExecuteBlock(code, bodyStart, bodyEnd, context, ref instructionBudget);
+                                    ExecuteBlock(code, bodyStart, bodyEnd, context);
                                 }
                                 finally
                                 {
@@ -773,8 +938,7 @@ namespace OpenSWFUnity.Runtime.AVM1
                         }
 
                         default:
-                            if (VerboseLogging)
-                                Debug.Log("AVM1 opcode 0x" + opcode.ToString("X2") + " skipped at " + actionStart);
+                            ReportUnsupportedOpcode(opcode, actionStart, payloadEnd - payloadStart);
                             break;
                     }
                 }
@@ -798,8 +962,7 @@ namespace OpenSWFUnity.Runtime.AVM1
             byte[] code,
             int payloadStart,
             int payloadEnd,
-            ExecutionContext context,
-            ref int instructionBudget
+            ExecutionContext context
         )
         {
             int cursor = payloadStart;
@@ -840,7 +1003,7 @@ namespace OpenSWFUnity.Runtime.AVM1
 
             try
             {
-                ExecuteBlock(code, tryStart, tryEnd, context, ref instructionBudget);
+                ExecuteBlock(code, tryStart, tryEnd, context);
             }
             catch (Avm1ThrownException thrown)
             {
@@ -857,7 +1020,7 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                         try
                         {
-                            ExecuteBlock(code, catchStart, catchEnd, context, ref instructionBudget);
+                            ExecuteBlock(code, catchStart, catchEnd, context);
                         }
                         catch (Avm1ThrownException catchThrown)
                         {
@@ -876,7 +1039,7 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                         try
                         {
-                            ExecuteBlock(code, catchStart, catchEnd, context, ref instructionBudget);
+                            ExecuteBlock(code, catchStart, catchEnd, context);
                         }
                         catch (Avm1ThrownException catchThrown)
                         {
@@ -904,8 +1067,7 @@ namespace OpenSWFUnity.Runtime.AVM1
                         code,
                         finallyStart,
                         finallyEnd,
-                        context,
-                        ref instructionBudget
+                        context
                     );
 
                     if (!context.Returned && returnedBeforeFinally)
@@ -983,6 +1145,14 @@ namespace OpenSWFUnity.Runtime.AVM1
             }
         }
 
+        // Decoding a DefineFunction copies its body out of the tag and snapshots the
+        // constant pool. Scripts routinely define closures inside a handler that runs
+        // every frame (`this.onEnterFrame = function () { ... }`), so that work would
+        // repeat forever. The decoded, immutable half is cached per (action bytes,
+        // offset); only the per-definition closure state is rebuilt on each execution.
+        private readonly Dictionary<byte[], Dictionary<int, Avm1FunctionTemplate>> functionTemplates =
+            new Dictionary<byte[], Dictionary<int, Avm1FunctionTemplate>>();
+
         private Avm1Function ParseFunction(
             byte[] code,
             byte opcode,
@@ -993,7 +1163,56 @@ namespace OpenSWFUnity.Runtime.AVM1
             out int bodyEnd
         )
         {
-            bodyEnd = payloadEnd;
+            if (!functionTemplates.TryGetValue(code, out Dictionary<int, Avm1FunctionTemplate> byOffset))
+            {
+                byOffset = new Dictionary<int, Avm1FunctionTemplate>();
+                functionTemplates[code] = byOffset;
+            }
+
+            if (!byOffset.TryGetValue(payloadStart, out Avm1FunctionTemplate template))
+            {
+                template = ParseFunctionTemplate(
+                    code,
+                    opcode,
+                    payloadStart,
+                    payloadEnd,
+                    blockEnd,
+                    constantPool
+                );
+                byOffset[payloadStart] = template;
+            }
+
+            if (template == null)
+            {
+                bodyEnd = payloadEnd;
+                return null;
+            }
+
+            bodyEnd = template.BodyEnd;
+
+            // The structural parse above is a pure function of (bytes, offset) and is
+            // cached, but the constant pool in force at this point is not: a branch can
+            // reach the same definition with a different pool loaded. Snapshot it per
+            // definition, sharing a single empty instance for the common trivial case.
+            List<string> pool = constantPool == null || constantPool.Count == 0
+                ? EmptyConstantPool
+                : new List<string>(constantPool);
+
+            return new Avm1Function(template, pool, nameComparer);
+        }
+
+        private static readonly List<string> EmptyConstantPool = new List<string>();
+
+        private Avm1FunctionTemplate ParseFunctionTemplate(
+            byte[] code,
+            byte opcode,
+            int payloadStart,
+            int payloadEnd,
+            int blockEnd,
+            List<string> constantPool
+        )
+        {
+            int bodyEnd = payloadEnd;
             int cursor = payloadStart;
             string functionName = ReadString(code, ref cursor, payloadEnd);
 
@@ -1044,15 +1263,15 @@ namespace OpenSWFUnity.Runtime.AVM1
             byte[] body = new byte[Math.Max(0, bodyEnd - bodyStart)];
             Array.Copy(code, bodyStart, body, 0, body.Length);
 
-            return new Avm1Function(
-                functionName,
-                parameters,
-                registerCount,
-                flags,
-                body,
-                new List<string>(constantPool),
-                nameComparer
-            );
+            return new Avm1FunctionTemplate
+            {
+                Name = functionName,
+                Parameters = parameters,
+                RegisterCount = registerCount,
+                Flags = flags,
+                Code = body,
+                BodyEnd = bodyEnd
+            };
         }
 
         private void RegisterFunction(ExecutionContext context, Avm1Function function)
@@ -1060,12 +1279,16 @@ namespace OpenSWFUnity.Runtime.AVM1
             DefinedFunctionCount++;
 
             function.CapturedLocals = context?.Locals;
-            function.CapturedOuterLocals = context != null
-                ? new List<Dictionary<string, object>>(context.OuterLocals)
-                : new List<Dictionary<string, object>>();
-            function.CapturedScopes = context != null
-                ? new List<Avm1Object>(context.ScopeObjects)
-                : new List<Avm1Object>();
+
+            // The context's own lists are pooled and reused, so a closure must take a
+            // copy - but the overwhelmingly common case is a function defined at the top
+            // level, which captures nothing and can share the static empty lists.
+            if (context != null && context.OuterLocals.Count > 0)
+                function.CapturedOuterLocals = new List<Dictionary<string, object>>(context.OuterLocals);
+
+            if (context != null && context.ScopeObjects.Count > 0)
+                function.CapturedScopes = new List<Avm1Object>(context.ScopeObjects);
+
             function.DefiningTarget = context?.Target;
 
             if (string.IsNullOrEmpty(function.Name))
@@ -1082,13 +1305,33 @@ namespace OpenSWFUnity.Runtime.AVM1
             if (!(callable is Avm1Function function))
                 return Undefined;
 
+            // Refusing the call here is what keeps unbounded AS recursion from becoming
+            // a StackOverflowException, which .NET cannot catch and which would kill the
+            // player outright rather than just abandoning the script.
+            int depthLimit = MaxCallDepth > 0 ? MaxCallDepth : DefaultMaxCallDepth;
+
+            if (callDepth >= depthLimit)
+            {
+                AbortedCallCount++;
+
+                if (AbortedCallCount <= MaxMalformedReports)
+                {
+                    ReportWarning(
+                        "AVM1 call depth limit of " + depthLimit + " reached while calling '" +
+                        (string.IsNullOrEmpty(function.Name) ? "<anonymous>" : function.Name) +
+                        "'; the call was abandoned to avoid a stack overflow." +
+                        (AbortedCallCount == MaxMalformedReports
+                            ? " Further call-depth reports are suppressed."
+                            : string.Empty)
+                    );
+                }
+
+                return Undefined;
+            }
+
             Dictionary<string, object> locals =
                 new Dictionary<string, object>(nameComparer);
-            ExecutionContext context = new ExecutionContext(
-                locals,
-                new List<string>(function.ConstantPool),
-                true
-            );
+            ExecutionContext context = RentContext(locals, function.ConstantPool, true);
             object resolvedThis = thisObject ?? RootObject;
             context.Target = resolvedThis;
             context.OriginalTarget = resolvedThis;
@@ -1128,9 +1371,28 @@ namespace OpenSWFUnity.Runtime.AVM1
                     context.Registers[parameter.Register] = argument;
             }
 
-            int budget = DefaultInstructionBudget;
-            ExecuteBlock(function.Code, 0, function.Code.Length, context, ref budget);
-            return context.ReturnValue;
+            // Nested calls draw from the caller's remaining allowance rather than a fresh
+            // one, so a script that loops through function calls is still bounded.
+            BeginExecution();
+            callDepth++;
+
+            try
+            {
+                ExecuteBlock(function.Code, 0, function.Code.Length, context);
+            }
+            finally
+            {
+                callDepth--;
+                EndExecution();
+            }
+
+            object returnValue = context.ReturnValue;
+
+            // Only recycled on the normal path: if the call unwound through a thrown
+            // AVM1 exception the context is abandoned rather than risk handing a
+            // half-unwound register file to the next caller.
+            ReturnContext(context);
+            return returnValue;
         }
 
         private static object ResolveSuperClass(object thisObject, Avm1Function function)
@@ -1168,6 +1430,20 @@ namespace OpenSWFUnity.Runtime.AVM1
             }
 
             object result = CallValue(constructor, arguments ?? EmptyArguments, instance);
+
+            // Built-in constructors are factories: `new Array()` produces a List and
+            // `new String()` a string, neither of which is an Avm1Object. Discarding
+            // them left `new Array()` evaluating to a blank object, so an array built
+            // that way silently lost push/length and every element written to it.
+            if (constructor is Avm1NativeFunction)
+            {
+                return result == null || ReferenceEquals(result, Undefined)
+                    ? instance
+                    : result;
+            }
+
+            // Script constructors follow the ECMAScript rule: an explicitly returned
+            // object replaces `this`, anything else leaves `this` as the result.
             return result is Avm1Object ? result : instance;
         }
 
@@ -1394,9 +1670,30 @@ namespace OpenSWFUnity.Runtime.AVM1
                 double value = NumberAt(args, 0);
                 return !double.IsNaN(value) && !double.IsInfinity(value);
             });
-            globals["Number"] = new Avm1NativeFunction(args => NumberAt(args, 0));
-            globals["String"] = new Avm1NativeFunction(args =>
+            Avm1NativeFunction numberConstructor =
+                new Avm1NativeFunction(args => NumberAt(args, 0));
+            numberConstructor.Set("MAX_VALUE", double.MaxValue);
+            numberConstructor.Set("MIN_VALUE", double.Epsilon);
+            numberConstructor.Set("NaN", double.NaN);
+            numberConstructor.Set("POSITIVE_INFINITY", double.PositiveInfinity);
+            numberConstructor.Set("NEGATIVE_INFINITY", double.NegativeInfinity);
+            globals["Number"] = numberConstructor;
+
+            Avm1NativeFunction stringConstructor = new Avm1NativeFunction(args =>
                 args != null && args.Count > 0 ? ToAvm1String(args[0]) : string.Empty);
+            stringConstructor.Set("fromCharCode", new Avm1NativeFunction(args =>
+            {
+                if (args == null || args.Count == 0)
+                    return string.Empty;
+
+                StringBuilder builder = new StringBuilder(args.Count);
+
+                for (int i = 0; i < args.Count; i++)
+                    builder.Append((char)(ushort)ToNumber(args[i]));
+
+                return builder.ToString();
+            }));
+            globals["String"] = stringConstructor;
             globals["Boolean"] = new Avm1NativeFunction(args =>
                 args != null && args.Count > 0 && ToBoolean(args[0]));
             Avm1NativeFunction objectConstructor = new Avm1NativeFunction(args =>
@@ -1416,14 +1713,48 @@ namespace OpenSWFUnity.Runtime.AVM1
             }));
             globals["Object"] = objectConstructor;
             globals["Array"] = new Avm1NativeFunction(args =>
-                new List<object>(args ?? EmptyArguments));
+            {
+                // `new Array(n)` with a single numeric argument presizes the array;
+                // every other form treats the arguments as the initial elements.
+                if (args != null && args.Count == 1 && !(args[0] is string) &&
+                    args[0] != null && !ReferenceEquals(args[0], Undefined))
+                {
+                    double requested = ToNumber(args[0]);
+
+                    if (!double.IsNaN(requested) && requested >= 0d && requested < 1000000d &&
+                        Math.Abs(requested - Math.Floor(requested)) < double.Epsilon)
+                    {
+                        int length = (int)requested;
+                        List<object> presized = new List<object>(length);
+
+                        for (int i = 0; i < length; i++)
+                            presized.Add(Undefined);
+
+                        return presized;
+                    }
+                }
+
+                return new List<object>(args ?? EmptyArguments);
+            });
             globals["MovieClip"] = new Avm1NativeFunction(args => null);
             globals["Button"] = new Avm1NativeFunction(args => null);
             globals["TextField"] = new Avm1NativeFunction(args => null);
             globals["ASSetPropFlags"] = new Avm1NativeFunction(args => null);
             Avm1Object asBroadcaster = CreateObject();
             asBroadcaster.Set("initialize", new Avm1NativeFunction(args =>
-                args.Count > 0 && args[0] is Avm1Object));
+            {
+                if (args.Count == 0 || !(args[0] is Avm1Object subject))
+                    return false;
+
+                // addListener/removeListener/broadcastMessage are already served for any
+                // object by the member table; what initialize must do is create the
+                // listener array, so broadcasting before the first addListener is a
+                // no-op rather than a failure.
+                if (!(subject.Get("__listeners") is List<object>))
+                    subject.Set("__listeners", new List<object>());
+
+                return true;
+            }));
             globals["AsBroadcaster"] = asBroadcaster;
             globals["Mouse"] = CreateObject();
             Avm1Object key = CreateObject();
@@ -1547,6 +1878,75 @@ namespace OpenSWFUnity.Runtime.AVM1
                 Warning(message);
             else
                 Debug.LogWarning(message);
+        }
+
+        // Reported once per distinct opcode, then only tallied. Silently skipping an
+        // action changes program behaviour, so the first occurrence is always surfaced
+        // even with verbose logging off; the running total is available afterwards via
+        // UnsupportedOpcodeCounts and DescribeDiagnostics.
+        private void ReportUnsupportedOpcode(byte opcode, int offset, int payloadLength)
+        {
+            unsupportedOpcodeCounts.TryGetValue(opcode, out int seen);
+            unsupportedOpcodeCounts[opcode] = seen + 1;
+
+            if (!reportedUnsupportedOpcodes.Add(opcode))
+                return;
+
+            ReportWarning(
+                "Unsupported AVM1 opcode 0x" + opcode.ToString("X2") +
+                " at offset " + offset +
+                " (payload " + payloadLength + " bytes) was skipped. " +
+                "Further occurrences of this opcode are counted but not logged."
+            );
+        }
+
+        private void ReportMalformedInstruction(byte opcode, int offset, string detail)
+        {
+            MalformedInstructionCount++;
+
+            if (MalformedInstructionCount > MaxMalformedReports)
+                return;
+
+            ReportWarning(
+                "Malformed AVM1 instruction 0x" + opcode.ToString("X2") +
+                " at offset " + offset + ": " + detail + "." +
+                (MalformedInstructionCount == MaxMalformedReports
+                    ? " Further malformed-instruction reports are suppressed."
+                    : string.Empty)
+            );
+        }
+
+        private const int MaxMalformedReports = 8;
+
+        // One-line health summary for the console or a test assertion.
+        public string DescribeDiagnostics()
+        {
+            StringBuilder builder = new StringBuilder();
+            builder.Append("AVM1 diagnostics: functions=").Append(DefinedFunctionCount);
+            builder.Append(", malformedInstructions=").Append(MalformedInstructionCount);
+            builder.Append(", abortedCalls=").Append(AbortedCallCount);
+
+            if (unsupportedOpcodeCounts.Count == 0)
+            {
+                builder.Append(", unsupportedOpcodes=none");
+                return builder.ToString();
+            }
+
+            builder.Append(", unsupportedOpcodes=[");
+            bool first = true;
+
+            foreach (KeyValuePair<byte, int> entry in unsupportedOpcodeCounts)
+            {
+                if (!first)
+                    builder.Append(", ");
+
+                builder.Append("0x").Append(entry.Key.ToString("X2"));
+                builder.Append(" x").Append(entry.Value);
+                first = false;
+            }
+
+            builder.Append(']');
+            return builder.ToString();
         }
 
         private object ResolveVariable(ExecutionContext context, string name)
@@ -1778,6 +2178,59 @@ namespace OpenSWFUnity.Runtime.AVM1
             return target;
         }
 
+        // AVM1 member names are matched case-insensitively. Resolving them through these
+        // ordinal-ignore-case tables keeps the lookup allocation-free, which matters
+        // because member access is the single hottest operation in the interpreter.
+        private const int MemberHasOwnProperty = 1;
+        private const int MemberIsPrototypeOf = 2;
+        private const int MemberToString = 3;
+        private const int MemberValueOf = 4;
+        private const int MemberAddProperty = 5;
+        private const int MemberDefineGetter = 6;
+        private const int MemberDefineSetter = 7;
+        private const int MemberAddEventListener = 8;
+        private const int MemberRemoveEventListener = 9;
+        private const int MemberDispatchEvent = 10;
+        private const int MemberAddListener = 11;
+        private const int MemberRemoveListener = 12;
+        private const int MemberBroadcastMessage = 13;
+        private const int MemberCall = 14;
+        private const int MemberApply = 15;
+
+        // Display properties the player derives rather than stores. They resolve here,
+        // on the member-miss path, so an object that holds a real value for the name
+        // (the root's _width, which is the stage width) still returns it first and
+        // ordinary member reads pay nothing for this.
+        public const int ComputedPropertyWidth = 16;
+        public const int ComputedPropertyHeight = 17;
+
+        private static readonly Dictionary<string, int> ObjectMemberIds =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "hasOwnProperty", MemberHasOwnProperty },
+                { "isPrototypeOf", MemberIsPrototypeOf },
+                { "toString", MemberToString },
+                { "valueOf", MemberValueOf },
+                { "addProperty", MemberAddProperty },
+                { "__defineGetter__", MemberDefineGetter },
+                { "__defineSetter__", MemberDefineSetter },
+                { "addEventListener", MemberAddEventListener },
+                { "removeEventListener", MemberRemoveEventListener },
+                { "dispatchEvent", MemberDispatchEvent },
+                { "addListener", MemberAddListener },
+                { "removeListener", MemberRemoveListener },
+                { "broadcastMessage", MemberBroadcastMessage },
+                { "call", MemberCall },
+                { "apply", MemberApply },
+                { "_width", ComputedPropertyWidth },
+                { "_height", ComputedPropertyHeight }
+            };
+
+        // Supplied by the player, which owns the display hierarchy and the character
+        // bounds needed to derive these. Null when no movie is loaded.
+        public Func<Avm1Object, int, object> ComputedPropertyGetter { get; set; }
+        public Func<Avm1Object, int, object, bool> ComputedPropertySetter { get; set; }
+
         private object GetMember(object target, string name)
         {
             if (ReferenceEquals(target, Undefined) || target == null)
@@ -1806,12 +2259,18 @@ namespace OpenSWFUnity.Runtime.AVM1
                 if (avmObject.TryGet(name, out object value))
                     return value;
 
-                switch ((name ?? string.Empty).ToLowerInvariant())
+                // Reached on every member miss, including ordinary `_x`/`_y` reads on a
+                // clip that has not set them yet. Lower-casing the name here allocated a
+                // string per miss; an ordinal-ignore-case lookup allocates nothing.
+                if (!ObjectMemberIds.TryGetValue(name ?? string.Empty, out int objectMemberId))
+                    return Undefined;
+
+                switch (objectMemberId)
                 {
-                    case "hasownproperty":
+                    case MemberHasOwnProperty:
                         return new Avm1NativeFunction(args =>
                             args.Count > 0 && avmObject.TryGetOwn(ToAvm1String(args[0]), out _));
-                    case "isprototypeof":
+                    case MemberIsPrototypeOf:
                         return new Avm1NativeFunction(args =>
                         {
                             Avm1Object current = args.Count > 0
@@ -1829,11 +2288,11 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                             return false;
                         });
-                    case "tostring":
+                    case MemberToString:
                         return new Avm1NativeFunction(args => "[object Object]");
-                    case "valueof":
+                    case MemberValueOf:
                         return new Avm1NativeFunction(args => avmObject);
-                    case "addproperty":
+                    case MemberAddProperty:
                         return new Avm1NativeFunction(args =>
                         {
                             if (args.Count < 3)
@@ -1844,21 +2303,21 @@ namespace OpenSWFUnity.Runtime.AVM1
                             StorePropertyAccessor(avmObject, "__setters", propertyName, args[2]);
                             return true;
                         });
-                    case "__definegetter__":
+                    case MemberDefineGetter:
                         return new Avm1NativeFunction(args =>
                         {
                             if (args.Count < 2) return false;
                             StorePropertyAccessor(avmObject, "__getters", ToAvm1String(args[0]), args[1]);
                             return true;
                         });
-                    case "__definesetter__":
+                    case MemberDefineSetter:
                         return new Avm1NativeFunction(args =>
                         {
                             if (args.Count < 2) return false;
                             StorePropertyAccessor(avmObject, "__setters", ToAvm1String(args[0]), args[1]);
                             return true;
                         });
-                    case "addeventlistener":
+                    case MemberAddEventListener:
                         return new Avm1NativeFunction(args =>
                         {
                             if (args.Count < 2)
@@ -1886,7 +2345,7 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                             return true;
                         });
-                    case "removeeventlistener":
+                    case MemberRemoveEventListener:
                         return new Avm1NativeFunction(args =>
                         {
                             if (args.Count < 2 ||
@@ -1898,10 +2357,10 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                             return listeners.Remove(args[1]);
                         });
-                    case "dispatchevent":
+                    case MemberDispatchEvent:
                         return new Avm1NativeFunction(args =>
                             args.Count > 0 && DispatchEvent(avmObject, args[0]));
-                    case "addlistener":
+                    case MemberAddListener:
                         return new Avm1NativeFunction(args =>
                         {
                             List<object> listeners = avmObject.Get("__listeners") as List<object>;
@@ -1917,13 +2376,13 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                             return args.Count > 0;
                         });
-                    case "removelistener":
+                    case MemberRemoveListener:
                         return new Avm1NativeFunction(args =>
                             args.Count > 0 && avmObject.Get("__listeners") is List<object> listeners &&
                             listeners.Remove(args[0]));
-                    case "broadcastmessage":
+                    case MemberBroadcastMessage:
                         return new Avm1NativeFunction(args => BroadcastMessage(avmObject, args));
-                    case "call" when IsCallable(avmObject):
+                    case MemberCall when IsCallable(avmObject):
                         return new Avm1NativeFunction(args =>
                         {
                             object receiver = args.Count > 0 ? args[0] : RootObject;
@@ -1934,7 +2393,13 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                             return CallValue(avmObject, callArguments, receiver);
                         });
-                    case "apply" when IsCallable(avmObject):
+                    case ComputedPropertyWidth:
+                    case ComputedPropertyHeight:
+                        return ComputedPropertyGetter != null
+                            ? ComputedPropertyGetter(avmObject, objectMemberId) ?? Undefined
+                            : Undefined;
+
+                    case MemberApply when IsCallable(avmObject):
                         return new Avm1NativeFunction(args =>
                         {
                             object receiver = args.Count > 0 ? args[0] : RootObject;
@@ -2042,17 +2507,82 @@ namespace OpenSWFUnity.Runtime.AVM1
             return true;
         }
 
+        private const int ArrayPush = 1;
+        private const int ArrayPop = 2;
+        private const int ArrayShift = 3;
+        private const int ArrayUnshift = 4;
+        private const int ArrayJoin = 5;
+        private const int ArraySlice = 6;
+        private const int ArraySplice = 7;
+        private const int ArrayConcat = 8;
+        private const int ArrayReverse = 9;
+        private const int ArrayIndexof = 10;
+        private const int ArrayTostring = 11;
+        private const int ArraySort = 12;
+
+        private static readonly Dictionary<string, int> ArrayMethodIds =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "push", ArrayPush },
+                { "pop", ArrayPop },
+                { "shift", ArrayShift },
+                { "unshift", ArrayUnshift },
+                { "join", ArrayJoin },
+                { "slice", ArraySlice },
+                { "splice", ArraySplice },
+                { "concat", ArrayConcat },
+                { "reverse", ArrayReverse },
+                { "indexOf", ArrayIndexof },
+                { "toString", ArrayTostring },
+                { "sort", ArraySort }
+            };
+
+        private const int StrCharat = 1;
+        private const int StrCharcodeat = 2;
+        private const int StrIndexof = 3;
+        private const int StrLastindexof = 4;
+        private const int StrSubstr = 5;
+        private const int StrSubstring = 6;
+        private const int StrSlice = 7;
+        private const int StrTolowercase = 8;
+        private const int StrTouppercase = 9;
+        private const int StrSplit = 10;
+        private const int StrTostring = 11;
+        private const int StrValueof = 12;
+        private const int StrConcat = 13;
+
+        private static readonly Dictionary<string, int> StringMethodIds =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "charAt", StrCharat },
+                { "charCodeAt", StrCharcodeat },
+                { "indexOf", StrIndexof },
+                { "lastIndexOf", StrLastindexof },
+                { "substr", StrSubstr },
+                { "substring", StrSubstring },
+                { "slice", StrSlice },
+                { "toLowerCase", StrTolowercase },
+                { "toUpperCase", StrTouppercase },
+                { "split", StrSplit },
+                { "toString", StrTostring },
+                { "valueOf", StrValueof },
+                { "concat", StrConcat }
+            };
+
         private object GetArrayMethod(IList<object> list, string name)
         {
-            switch ((name ?? string.Empty).ToLowerInvariant())
+            if (!ArrayMethodIds.TryGetValue(name ?? string.Empty, out int methodId))
+                return null;
+
+            switch (methodId)
             {
-                case "push":
+                case ArrayPush:
                     return new Avm1NativeFunction(args =>
                     {
                         for (int i = 0; i < args.Count; i++) list.Add(args[i]);
                         return list.Count;
                     });
-                case "pop":
+                case ArrayPop:
                     return new Avm1NativeFunction(args =>
                     {
                         if (list.Count == 0) return Undefined;
@@ -2060,7 +2590,7 @@ namespace OpenSWFUnity.Runtime.AVM1
                         list.RemoveAt(list.Count - 1);
                         return value;
                     });
-                case "shift":
+                case ArrayShift:
                     return new Avm1NativeFunction(args =>
                     {
                         if (list.Count == 0) return Undefined;
@@ -2068,18 +2598,18 @@ namespace OpenSWFUnity.Runtime.AVM1
                         list.RemoveAt(0);
                         return value;
                     });
-                case "unshift":
+                case ArrayUnshift:
                     return new Avm1NativeFunction(args =>
                     {
                         for (int i = 0; i < args.Count; i++) list.Insert(i, args[i]);
                         return list.Count;
                     });
-                case "join":
+                case ArrayJoin:
                     return new Avm1NativeFunction(args => string.Join(
                         args.Count > 0 ? ToAvm1String(args[0]) : ",",
                         ToStringArray(list)
                     ));
-                case "slice":
+                case ArraySlice:
                     return new Avm1NativeFunction(args =>
                     {
                         int start = NormalizeIndex(args.Count > 0 ? ToNumber(args[0]) : 0d, list.Count);
@@ -2089,7 +2619,7 @@ namespace OpenSWFUnity.Runtime.AVM1
                         for (int i = start; i < Math.Max(start, end); i++) result.Add(list[i]);
                         return result;
                     });
-                case "splice":
+                case ArraySplice:
                     return new Avm1NativeFunction(args =>
                     {
                         int start = NormalizeIndex(args.Count > 0 ? ToNumber(args[0]) : 0d, list.Count);
@@ -2107,7 +2637,7 @@ namespace OpenSWFUnity.Runtime.AVM1
                         for (int i = 2; i < args.Count; i++) list.Insert(start + i - 2, args[i]);
                         return removed;
                     });
-                case "concat":
+                case ArrayConcat:
                     return new Avm1NativeFunction(args =>
                     {
                         List<object> result = new List<object>(list);
@@ -2126,7 +2656,7 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                         return result;
                     });
-                case "reverse":
+                case ArrayReverse:
                     return new Avm1NativeFunction(args =>
                     {
                         for (int left = 0, right = list.Count - 1; left < right; left++, right--)
@@ -2138,7 +2668,7 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                         return list;
                     });
-                case "indexof":
+                case ArrayIndexof:
                     return new Avm1NativeFunction(args =>
                     {
                         object sought = args.Count > 0 ? args[0] : Undefined;
@@ -2148,8 +2678,39 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                         return -1;
                     });
-                case "tostring":
+                case ArrayTostring:
                     return new Avm1NativeFunction(args => string.Join(",", ToStringArray(list)));
+                case ArraySort:
+                    return new Avm1NativeFunction(args =>
+                    {
+                        object comparator = args.Count > 0 && IsCallable(args[0]) ? args[0] : null;
+                        List<object> ordered = new List<object>(list);
+
+                        // A comparator that throws, or that reports an inconsistent
+                        // ordering, makes List.Sort raise InvalidOperationException.
+                        // Flash just leaves the array alone, so match that.
+                        try
+                        {
+                            ordered.Sort((left, right) => comparator != null
+                                ? (int)ToNumber(CallValue(
+                                    comparator,
+                                    new[] { left, right },
+                                    RootObject))
+                                : string.Compare(
+                                    ToAvm1String(left),
+                                    ToAvm1String(right),
+                                    StringComparison.Ordinal));
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            return list;
+                        }
+
+                        for (int i = 0; i < list.Count; i++)
+                            list[i] = ordered[i];
+
+                        return list;
+                    });
                 default:
                     return null;
             }
@@ -2157,28 +2718,31 @@ namespace OpenSWFUnity.Runtime.AVM1
 
         private static object GetStringMethod(string text, string name)
         {
-            switch ((name ?? string.Empty).ToLowerInvariant())
+            if (!StringMethodIds.TryGetValue(name ?? string.Empty, out int methodId))
+                return null;
+
+            switch (methodId)
             {
-                case "charat": return new Avm1NativeFunction(args =>
+                case StrCharat: return new Avm1NativeFunction(args =>
                 {
                     int index = (int)NumberAt(args, 0);
                     return index >= 0 && index < text.Length ? text[index].ToString() : string.Empty;
                 });
-                case "charcodeat": return new Avm1NativeFunction(args =>
+                case StrCharcodeat: return new Avm1NativeFunction(args =>
                 {
                     int index = (int)NumberAt(args, 0);
                     return index >= 0 && index < text.Length ? (double)text[index] : double.NaN;
                 });
-                case "indexof": return new Avm1NativeFunction(args => text.IndexOf(
+                case StrIndexof: return new Avm1NativeFunction(args => text.IndexOf(
                     args.Count > 0 ? ToAvm1String(args[0]) : string.Empty,
                     Math.Max(0, args.Count > 1 ? (int)ToNumber(args[1]) : 0),
                     StringComparison.Ordinal
                 ));
-                case "lastindexof": return new Avm1NativeFunction(args => text.LastIndexOf(
+                case StrLastindexof: return new Avm1NativeFunction(args => text.LastIndexOf(
                     args.Count > 0 ? ToAvm1String(args[0]) : string.Empty,
                     StringComparison.Ordinal
                 ));
-                case "substr": return new Avm1NativeFunction(args =>
+                case StrSubstr: return new Avm1NativeFunction(args =>
                 {
                     int start = NormalizeIndex(args.Count > 0 ? ToNumber(args[0]) : 0d, text.Length);
                     int length = args.Count > 1
@@ -2186,7 +2750,7 @@ namespace OpenSWFUnity.Runtime.AVM1
                         : text.Length - start;
                     return text.Substring(start, length);
                 });
-                case "substring": return new Avm1NativeFunction(args =>
+                case StrSubstring: return new Avm1NativeFunction(args =>
                 {
                     int start = Math.Max(0, Math.Min(text.Length, (int)NumberAt(args, 0)));
                     int end = args.Count > 1
@@ -2195,22 +2759,34 @@ namespace OpenSWFUnity.Runtime.AVM1
                     if (start > end) { int swap = start; start = end; end = swap; }
                     return text.Substring(start, end - start);
                 });
-                case "slice": return new Avm1NativeFunction(args =>
+                case StrSlice: return new Avm1NativeFunction(args =>
                 {
                     int start = NormalizeIndex(args.Count > 0 ? ToNumber(args[0]) : 0d, text.Length);
                     int end = NormalizeIndex(args.Count > 1 ? ToNumber(args[1]) : text.Length, text.Length);
                     return text.Substring(start, Math.Max(0, end - start));
                 });
-                case "tolowercase": return new Avm1NativeFunction(args => text.ToLowerInvariant());
-                case "touppercase": return new Avm1NativeFunction(args => text.ToUpperInvariant());
-                case "split": return new Avm1NativeFunction(args => new List<object>(
+                case StrTolowercase: return new Avm1NativeFunction(args => text.ToLowerInvariant());
+                case StrTouppercase: return new Avm1NativeFunction(args => text.ToUpperInvariant());
+                case StrSplit: return new Avm1NativeFunction(args => new List<object>(
                     Array.ConvertAll(
                         text.Split(new[] { args.Count > 0 ? ToAvm1String(args[0]) : "," }, StringSplitOptions.None),
                         value => (object)value
                     )
                 ));
-                case "tostring":
-                case "valueof": return new Avm1NativeFunction(args => text);
+                case StrTostring:
+                case StrValueof: return new Avm1NativeFunction(args => text);
+                case StrConcat: return new Avm1NativeFunction(args =>
+                {
+                    if (args == null || args.Count == 0)
+                        return text;
+
+                    StringBuilder builder = new StringBuilder(text);
+
+                    for (int i = 0; i < args.Count; i++)
+                        builder.Append(ToAvm1String(args[i]));
+
+                    return builder.ToString();
+                });
                 default: return null;
             }
         }
@@ -2243,6 +2819,19 @@ namespace OpenSWFUnity.Runtime.AVM1
                     setterMap.Get(name) is object setter && IsCallable(setter))
                 {
                     CallValue(setter, new object[] { value }, avmObject);
+                    return;
+                }
+
+                // Assigning _width/_height rescales the object. It must not fall through
+                // to a plain Set, or the stored value would shadow the derived one and
+                // the property would freeze at whatever was last written.
+                if (ComputedPropertySetter != null &&
+                    !string.IsNullOrEmpty(name) && name[0] == '_' &&
+                    ObjectMemberIds.TryGetValue(name, out int computedId) &&
+                    (computedId == ComputedPropertyWidth || computedId == ComputedPropertyHeight) &&
+                    !avmObject.TryGetOwn(name, out _) &&
+                    ComputedPropertySetter(avmObject, computedId, value))
+                {
                     return;
                 }
 
@@ -2549,13 +3138,20 @@ namespace OpenSWFUnity.Runtime.AVM1
 
         private static readonly IReadOnlyList<object> EmptyArguments = new object[0];
 
+        // Pooled: a context owns a 256-slot register file plus several lists, and a
+        // busy movie calls AVM1 functions thousands of times per frame. Allocating
+        // that per call produced megabytes of short-lived garbage and regular GC
+        // spikes. None of these containers outlive the call - closures capture only
+        // the Locals dictionary, which is still created fresh - so they can be reused.
         private sealed class ExecutionContext
         {
+            public const int RegisterCount = 256;
+
             public readonly List<object> Stack = new List<object>();
-            public readonly object[] Registers = new object[256];
+            public readonly object[] Registers = new object[RegisterCount];
             public Dictionary<string, object> Locals;
-            public readonly List<string> ConstantPool;
-            public readonly bool IsFunction;
+            public readonly List<string> ConstantPool = new List<string>();
+            public bool IsFunction;
             public readonly List<Dictionary<string, object>> OuterLocals =
                 new List<Dictionary<string, object>>();
             public readonly List<Avm1Object> ScopeObjects = new List<Avm1Object>();
@@ -2564,20 +3160,61 @@ namespace OpenSWFUnity.Runtime.AVM1
             public bool Returned;
             public object ReturnValue = Undefined;
 
-            public ExecutionContext(
+            public void Initialize(
                 Dictionary<string, object> locals,
-                List<string> constantPool,
+                List<string> constantPoolSource,
                 bool isFunction
             )
             {
                 Locals = locals;
-                ConstantPool = constantPool;
                 IsFunction = isFunction;
+                Returned = false;
+                ReturnValue = Undefined;
+                Target = null;
+                OriginalTarget = null;
+
+                ConstantPool.Clear();
+
+                if (constantPoolSource != null && constantPoolSource.Count > 0)
+                    ConstantPool.AddRange(constantPoolSource);
             }
+
+            // Clearing the register file matters beyond hygiene: stale entries would
+            // otherwise keep whole display objects alive for as long as the pooled
+            // context sits idle.
+            public void Reset()
+            {
+                Stack.Clear();
+                OuterLocals.Clear();
+                ScopeObjects.Clear();
+                ConstantPool.Clear();
+                Array.Clear(Registers, 0, Registers.Length);
+                Locals = null;
+                Target = null;
+                OriginalTarget = null;
+                ReturnValue = Undefined;
+                Returned = false;
+            }
+        }
+
+        // The decode-once half of a function definition. Every field is immutable after
+        // parsing and is shared by all closures created from the same definition site.
+        private sealed class Avm1FunctionTemplate
+        {
+            public string Name;
+            public Avm1Parameter[] Parameters;
+            public byte RegisterCount;
+            public ushort Flags;
+            public byte[] Code;
+            public int BodyEnd;
         }
 
         private sealed class Avm1Function : Avm1Object
         {
+            private static readonly List<Dictionary<string, object>> NoOuterLocals =
+                new List<Dictionary<string, object>>();
+            private static readonly List<Avm1Object> NoScopes = new List<Avm1Object>();
+
             public readonly string Name;
             public readonly Avm1Parameter[] Parameters;
             public readonly byte RegisterCount;
@@ -2585,26 +3222,24 @@ namespace OpenSWFUnity.Runtime.AVM1
             public readonly byte[] Code;
             public readonly List<string> ConstantPool;
             public Dictionary<string, object> CapturedLocals;
-            public List<Dictionary<string, object>> CapturedOuterLocals =
-                new List<Dictionary<string, object>>();
-            public List<Avm1Object> CapturedScopes = new List<Avm1Object>();
+
+            // Shared empty defaults: a top-level function captures no enclosing scope,
+            // and these lists are only ever read, never appended to in place.
+            public List<Dictionary<string, object>> CapturedOuterLocals = NoOuterLocals;
+            public List<Avm1Object> CapturedScopes = NoScopes;
             public object DefiningTarget;
 
             public Avm1Function(
-                string name,
-                Avm1Parameter[] parameters,
-                byte registerCount,
-                ushort flags,
-                byte[] code,
+                Avm1FunctionTemplate template,
                 List<string> constantPool,
                 StringComparer comparer
             ) : base(comparer)
             {
-                Name = name;
-                Parameters = parameters;
-                RegisterCount = registerCount;
-                Flags = flags;
-                Code = code;
+                Name = template.Name;
+                Parameters = template.Parameters;
+                RegisterCount = template.RegisterCount;
+                Flags = template.Flags;
+                Code = template.Code;
                 ConstantPool = constantPool;
 
                 Avm1Object prototype = new Avm1Object(comparer);
