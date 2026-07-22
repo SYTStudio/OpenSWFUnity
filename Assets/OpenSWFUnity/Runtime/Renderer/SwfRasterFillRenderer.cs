@@ -325,7 +325,11 @@ namespace OpenSWFUnity.Runtime.Renderer
                     if (style == null)
                         continue;
 
-                    Color fillColor = style.ToUnityColor();
+                    // Fill bytes in a SWF are sRGB, while this project's batched
+                    // mesh shader consumes vertex colours in working (linear)
+                    // space. Without this conversion every solid fill is washed
+                    // out, including the logo's orange and its darker cut shadows.
+                    Color fillColor = SwfRenderQuality.ToVertexColor(style.ToUnityColor());
                     Texture texture = ResolveBitmapTexture(style);
 
                     // A fill type outside the solid/gradient/bitmap families cannot be

@@ -88,6 +88,25 @@ namespace OpenSWFUnity.Runtime.Renderer
 
         public static event Action QualityChanged;
 
+        // SWF stores RGB channels as display (sRGB) bytes. Mesh/TextMesh vertex
+        // colours are fed straight into the shader, so Unity does not perform the
+        // automatic sRGB texture decode for them. In a Linear project, passing the
+        // bytes through unchanged makes #FFAD33 render as roughly #FDD67A. Convert
+        // only vertex colours into Unity's working space; camera clear colours and
+        // sampled bitmap textures already follow their own correct sRGB paths.
+        public static Color ToVertexColor(Color swfSrgb)
+        {
+            if (QualitySettings.activeColorSpace != ColorSpace.Linear)
+                return swfSrgb;
+
+            return new Color(
+                Mathf.GammaToLinearSpace(swfSrgb.r),
+                Mathf.GammaToLinearSpace(swfSrgb.g),
+                Mathf.GammaToLinearSpace(swfSrgb.b),
+                swfSrgb.a
+            );
+        }
+
         public static SwfQualitySettings Resolve(SwfQualityLevel level)
         {
             switch (level)

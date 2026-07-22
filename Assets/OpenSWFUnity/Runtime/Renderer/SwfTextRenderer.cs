@@ -71,7 +71,9 @@ namespace OpenSWFUnity.Runtime.Renderer
             textMesh.characterSize = characterSize * (64f / fontSize);
             textMesh.anchor = TextAnchor.UpperLeft;
             textMesh.alignment = TextAlignment.Left;
-            Color c = record.Color;
+            // TextMesh colours are vertex colours too, so they need the same SWF
+            // sRGB -> Unity working-space conversion as vector fills.
+            Color c = SwfRenderQuality.ToVertexColor(record.Color);
             c.a *= alpha;
             textMesh.color = c;
 
