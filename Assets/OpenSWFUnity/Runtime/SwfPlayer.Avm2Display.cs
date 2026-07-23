@@ -5,6 +5,7 @@ using OpenSWFUnity.Runtime.AVM2;
 using OpenSWFUnity.Runtime.AVM2.Values;
 using OpenSWFUnity.Runtime.Parser;
 using OpenSWFUnity.Runtime.Renderer;
+using OpenSWFUnity.Runtime.Tags;
 
 namespace OpenSWFUnity.Runtime
 {
@@ -20,7 +21,8 @@ namespace OpenSWFUnity.Runtime
         private Avm2DisplayObject avm2HoverTarget;
         private Avm2DisplayObject avm2PressTarget;
         private Vector2 avm2StagePoint;
-        private bool avm2TextRenderingReported;
+        private readonly Dictionary<Avm2BitmapData, Avm2BitmapTexture> avm2BitmapTextures =
+            new Dictionary<Avm2BitmapData, Avm2BitmapTexture>();
 
         // World matrix per display object, rebuilt once per frame during the hit-test
         // walk. Local coordinates and per-object mouseX/mouseY then cost a cached
@@ -74,6 +76,109 @@ namespace OpenSWFUnity.Runtime
             return null;
         }
 
+        public void NotifyInstanceConstructed(Avm2Class type, Avm2Object instance)
+        {
+            if (runtimeParser == null || type == null ||
+                !(instance is Avm2DisplayObject display))
+            {
+                return;
+            }
+
+            string linkageName = string.IsNullOrEmpty(type.Name.Uri)
+                ? type.Name.Local
+                : type.Name.Uri + "." + type.Name.Local;
+
+            if (!runtimeParser.ExportedAssets.TryGetValue(linkageName, out ushort characterId))
+                runtimeParser.ExportedAssets.TryGetValue(type.Name.ToString(), out characterId);
+
+            if (characterId == 0)
+                return;
+
+            display.CharacterId = characterId;
+            DefineSpriteTag sprite = runtimeParser.FindSpriteById(characterId);
+            display.TotalFrames = sprite != null
+                ? Mathf.Max(1, sprite.Frames.Count)
+                : 1;
+        }
+
+        public object ResolveTimelineChild(Avm2DisplayObject parent, string name)
+        {
+            if (runtimeParser == null || runtimeAvm2 == null || parent == null ||
+                parent.CharacterId == 0 || string.IsNullOrEmpty(name))
+            {
+                return null;
+            }
+
+            Avm2DisplayObject existing = parent.GetChildByName(name);
+
+            if (existing != null)
+                return existing;
+
+            DefineSpriteTag sprite = runtimeParser.FindSpriteById(parent.CharacterId);
+
+            if (sprite == null || sprite.Frames == null || sprite.Frames.Count == 0)
+                return null;
+
+            for (int frameIndex = 0; frameIndex < sprite.Frames.Count; frameIndex++)
+            {
+                List<SwfTag> tags = sprite.Frames[frameIndex].ControlTags;
+
+                for (int i = 0; i < tags.Count; i++)
+                {
+                    SwfTag tag = tags[i];
+
+                    if (tag == null || (tag.Code != 26 && tag.Code != 70))
+                        continue;
+
+                    PlaceObject2Tag place;
+
+                    try
+                    {
+                        place = runtimeParser.ParsePlaceObject2FromTag(tag);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (!place.HasName || !string.Equals(place.Name, name) ||
+                        !place.HasCharacter || place.CharacterId == 0)
+                    {
+                        continue;
+                    }
+
+                    Avm2Class nativeClass =
+                        runtimeParser.FindEditTextById(place.CharacterId) != null
+                            ? runtimeAvm2.Builtins.TextFieldClass
+                            : runtimeParser.FindSpriteById(place.CharacterId) != null
+                                ? runtimeAvm2.Builtins.MovieClipClass
+                                : runtimeParser.FindBitmapById(place.CharacterId) != null
+                                    ? runtimeAvm2.Builtins.BitmapClass
+                                    : runtimeAvm2.Builtins.ShapeClass;
+
+                    DefineSpriteTag childSprite =
+                        runtimeParser.FindSpriteById(place.CharacterId);
+                    Avm2DisplayObject child = new Avm2DisplayObject(nativeClass)
+                    {
+                        Name = name,
+                        CharacterId = place.CharacterId,
+                        X = place.Matrix.TranslateX,
+                        Y = place.Matrix.TranslateY,
+                        ScaleX = place.Matrix.ScaleX,
+                        ScaleY = place.Matrix.ScaleY,
+                        TotalFrames = childSprite != null
+                            ? Mathf.Max(1, childSprite.Frames.Count)
+                            : 1
+                    };
+
+                    parent.AddChild(child);
+                    return child;
+                }
+            }
+
+            return null;
+        }
+
         // ---- per-frame --------------------------------------------------------
 
         private void AdvanceAvm2Frame()
@@ -122,6 +227,9 @@ namespace OpenSWFUnity.Runtime
 
             SwfMatrix world = SwfMatrix.Combine(parentMatrix, BuildAvm2Matrix(node));
 
+            RenderAvm2Bitmap(node, world, alpha);
+            RenderAvm2Text(node, world, alpha);
+
             if (node.CharacterId != 0)
             {
                 RenderCharacterDebug(
@@ -145,6 +253,117 @@ namespace OpenSWFUnity.Runtime
 
             for (int i = 0; i < children.Count; i++)
                 RenderAvm2Node(parser, renderer, children[i], world, alpha, depth + 1);
+        }
+
+        private void RenderAvm2Bitmap(
+            Avm2DisplayObject node,
+            SwfMatrix world,
+            float alpha
+        )
+        {
+            if (runtimeRasterRenderer == null || runtimeAvm2?.Builtins.BitmapClass == null ||
+                node.Class == null ||
+                !node.Class.IsSubclassOf(runtimeAvm2.Builtins.BitmapClass) ||
+                !node.TryGetDynamic(
+                    Avm2QName.Public("__bitmapData"), out object bitmapDataValue) ||
+                !(bitmapDataValue is Avm2BitmapData bitmapData))
+            {
+                return;
+            }
+
+            if (!avm2BitmapTextures.TryGetValue(bitmapData, out Avm2BitmapTexture cached) ||
+                cached.Texture == null ||
+                cached.Texture.width != bitmapData.Width ||
+                cached.Texture.height != bitmapData.Height)
+            {
+                cached = new Avm2BitmapTexture
+                {
+                    Texture = new Texture2D(
+                        bitmapData.Width,
+                        bitmapData.Height,
+                        TextureFormat.RGBA32,
+                        false,
+                        false)
+                    {
+                        name = "AVM2_BitmapData_" + bitmapData.Width + "x" + bitmapData.Height,
+                        wrapMode = TextureWrapMode.Clamp,
+                        filterMode = FilterMode.Bilinear
+                    },
+                    Pixels = new Color32[bitmapData.Width * bitmapData.Height],
+                    Argb = new uint[bitmapData.Width * bitmapData.Height],
+                    Version = int.MinValue
+                };
+                avm2BitmapTextures[bitmapData] = cached;
+            }
+
+            if (cached.Version != bitmapData.Version)
+            {
+                bitmapData.CopyPixelsTo(cached.Argb);
+                int width = bitmapData.Width;
+                int height = bitmapData.Height;
+
+                // BitmapData is top-left based while Texture2D's first row is the
+                // bottom one. Flip only while uploading; AVM2 keeps native indices.
+                for (int y = 0; y < height; y++)
+                {
+                    int sourceRow = y * width;
+                    int destinationRow = (height - 1 - y) * width;
+                    for (int x = 0; x < width; x++)
+                    {
+                        uint argb = cached.Argb[sourceRow + x];
+                        cached.Pixels[destinationRow + x] = new Color32(
+                            (byte)(argb >> 16),
+                            (byte)(argb >> 8),
+                            (byte)argb,
+                            (byte)(argb >> 24));
+                    }
+                }
+
+                cached.Texture.SetPixels32(cached.Pixels);
+                cached.Texture.Apply(false, false);
+                cached.Version = bitmapData.Version;
+            }
+
+            runtimeRasterRenderer.DrawTextureQuad(
+                cached.Texture,
+                bitmapData.Width,
+                bitmapData.Height,
+                world,
+                alpha);
+        }
+
+        private void RenderAvm2Text(
+            Avm2DisplayObject node,
+            SwfMatrix world,
+            float alpha
+        )
+        {
+            if (runtimeTextRenderer == null || runtimeAvm2?.Builtins.TextFieldClass == null ||
+                node.Class == null ||
+                !node.Class.IsSubclassOf(runtimeAvm2.Builtins.TextFieldClass) ||
+                !node.TryGetDynamic(Avm2QName.Public("__text"), out object textValue))
+            {
+                return;
+            }
+
+            uint color = 0u;
+            if (node.TryGetDynamic(Avm2QName.Public("__textColor"), out object colorValue))
+                color = Avm2Convert.ToUint32(colorValue);
+
+            runtimeTextRenderer.DrawRuntimeText(
+                Avm2Convert.ToString(textValue),
+                world,
+                "AS3_Text_" + (string.IsNullOrEmpty(node.Name) ? "field" : node.Name),
+                color,
+                alpha);
+        }
+
+        private sealed class Avm2BitmapTexture
+        {
+            public Texture2D Texture;
+            public Color32[] Pixels;
+            public uint[] Argb;
+            public int Version;
         }
 
         // AS3 exposes position, scale and rotation separately; the renderer needs the
@@ -637,15 +856,8 @@ namespace OpenSWFUnity.Runtime
 
         void IAvm2DisplayHost.NotifyTextChanged(Avm2DisplayObject field)
         {
-            if (avm2TextRenderingReported || field == null)
-                return;
-
-            avm2TextRenderingReported = true;
-            Debug.LogWarning(
-                "An ActionScript 3 TextField's text was set. The field's value is stored and " +
-                "readable from script, but drawing AS3-authored text is not implemented, so " +
-                "nothing appears on screen for it."
-            );
+            if (field != null)
+                renderStateDirty = true;
         }
     }
 }

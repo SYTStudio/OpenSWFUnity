@@ -23,8 +23,17 @@ namespace OpenSWFUnity.Runtime.Audio
         private readonly Dictionary<ushort, AudioClip> clipsById = new Dictionary<ushort, AudioClip>();
         private readonly Dictionary<string, ushort> exportIds = new Dictionary<string, ushort>();
         private readonly List<string> temporaryFiles = new List<string>();
-        private readonly List<ushort> pendingSoundIds = new List<ushort>();
+        private readonly List<PendingSoundRequest> pendingSounds =
+            new List<PendingSoundRequest>();
         private readonly HashSet<int> reportedFormats = new HashSet<int>();
+        private readonly Dictionary<ushort, DefineSoundTag> soundsById =
+            new Dictionary<ushort, DefineSoundTag>();
+        private readonly Queue<DefineSoundTag> unityDecodeQueue =
+            new Queue<DefineSoundTag>();
+        private readonly HashSet<ushort> queuedUnitySoundIds = new HashSet<ushort>();
+        private readonly Dictionary<ushort, SpriteStreamState> spriteStreams =
+            new Dictionary<ushort, SpriteStreamState>();
+        private readonly HashSet<ushort> visibleSpriteStreams = new HashSet<ushort>();
 
         private Voice[] voices;
         private AudioSource streamSource;
@@ -48,6 +57,24 @@ namespace OpenSWFUnity.Runtime.Audio
             public AudioSource Source;
             public ushort SoundId;
             public bool InUse;
+        }
+
+        private sealed class PendingSoundRequest
+        {
+            public ushort SoundId;
+            public SwfSoundInfo Info;
+        }
+
+        private sealed class SpriteStreamState
+        {
+            public ushort SpriteId;
+            public SwfSoundStreamHead Head;
+            public List<SwfSoundStreamBlock> Blocks;
+            public AudioSource Source;
+            public AudioClip Clip;
+            public bool Loading;
+            public int FirstFrame;
+            public float SecondsPerFrame;
         }
 
         private void Awake()
@@ -79,15 +106,21 @@ namespace OpenSWFUnity.Runtime.Audio
 
         public void Initialize(SwfParser swfParser)
         {
-            if (loadingCoroutine != null)
-                StopCoroutine(loadingCoroutine);
+            StopAllCoroutines();
 
             EnsureVoices();
             StopAll();
             ClearLoadedAudio();
             exportIds.Clear();
-            pendingSoundIds.Clear();
+            pendingSounds.Clear();
             reportedFormats.Clear();
+            soundsById.Clear();
+            unityDecodeQueue.Clear();
+            queuedUnitySoundIds.Clear();
+            spriteStreams.Clear();
+            visibleSpriteStreams.Clear();
+            IsLoading = false;
+            loadingCoroutine = null;
             parser = swfParser;
 
             if (swfParser == null)
@@ -96,13 +129,21 @@ namespace OpenSWFUnity.Runtime.Audio
             foreach (KeyValuePair<string, ushort> asset in swfParser.ExportedAssets)
                 exportIds[asset.Key] = asset.Value;
 
+            for (int i = 0; i < swfParser.Sounds.Count; i++)
+            {
+                DefineSoundTag sound = swfParser.Sounds[i];
+
+                if (sound != null)
+                    soundsById[sound.SoundId] = sound;
+            }
+
             ReportUnsupportedFormats(swfParser);
             DecodeInternalSounds(swfParser);
             BuildStream(swfParser);
 
-            // Only the MP3 assets need Unity's decoder, and only those go through a
-            // coroutine; everything else is already resident by this point.
-            loadingCoroutine = StartCoroutine(LoadUnityDecodedSounds(swfParser.Sounds));
+            // MP3 event sounds are decoded on first use. A large game can carry
+            // hundreds of clips it may never play in this session; decoding every
+            // one during startup caused both a long load and repeated frame spikes.
         }
 
         private void ReportUnsupportedFormats(SwfParser swfParser)
@@ -310,6 +351,192 @@ namespace OpenSWFUnity.Runtime.Audio
 
         public bool IsStreamPlaying => streamActive && streamSource != null && streamSource.isPlaying;
 
+        // ---- nested sprite streams ------------------------------------------
+
+        public void BeginSpriteStreamFrame()
+        {
+            visibleSpriteStreams.Clear();
+        }
+
+        public void SyncSpriteStream(DefineSpriteTag sprite, int frameIndex, bool playing)
+        {
+            if (sprite?.SoundStreamHead == null ||
+                sprite.SoundStreamBlocks == null ||
+                sprite.SoundStreamBlocks.Count == 0)
+            {
+                return;
+            }
+
+            ushort spriteId = sprite.SpriteId;
+            visibleSpriteStreams.Add(spriteId);
+
+            if (!spriteStreams.TryGetValue(spriteId, out SpriteStreamState state))
+            {
+                AudioSource source = gameObject.AddComponent<AudioSource>();
+                source.playOnAwake = false;
+                source.spatialBlend = 0f;
+                source.loop = false;
+                state = new SpriteStreamState
+                {
+                    SpriteId = spriteId,
+                    Head = sprite.SoundStreamHead,
+                    Blocks = sprite.SoundStreamBlocks,
+                    Source = source,
+                    FirstFrame = sprite.SoundStreamBlocks[0].FrameIndex,
+                    SecondsPerFrame = sprite.SoundStreamHead.SamplesPerFrame > 0 &&
+                        sprite.SoundStreamHead.StreamSampleRate > 0
+                            ? (float)sprite.SoundStreamHead.SamplesPerFrame /
+                              sprite.SoundStreamHead.StreamSampleRate
+                            : 0f
+                };
+                spriteStreams[spriteId] = state;
+            }
+
+            if (state.Clip == null)
+            {
+                if (!state.Loading)
+                {
+                    state.Loading = true;
+                    StartCoroutine(BuildSpriteStream(state));
+                }
+
+                return;
+            }
+
+            SyncSpriteStreamSource(state, frameIndex, playing);
+        }
+
+        public void EndSpriteStreamFrame()
+        {
+            foreach (KeyValuePair<ushort, SpriteStreamState> pair in spriteStreams)
+            {
+                if (visibleSpriteStreams.Contains(pair.Key))
+                    continue;
+
+                AudioSource source = pair.Value.Source;
+
+                if (source != null && source.isPlaying)
+                    source.Stop();
+            }
+        }
+
+        private IEnumerator BuildSpriteStream(SpriteStreamState state)
+        {
+            SwfSoundStreamHead head = state.Head;
+
+            if (SwfSoundFormats.IsDecodedByUnity(head.StreamFormat))
+            {
+                using MemoryStream buffer = new MemoryStream();
+
+                for (int i = 0; i < state.Blocks.Count; i++)
+                {
+                    byte[] block = state.Blocks[i].Data;
+
+                    if (block != null)
+                        buffer.Write(block, 0, block.Length);
+                }
+
+                yield return LoadClipFromBytes(
+                    buffer.ToArray(),
+                    "swf_sprite_stream_" + state.SpriteId + ".mp3",
+                    clip =>
+                    {
+                        state.Clip = clip;
+                        state.Source.clip = clip;
+                    });
+            }
+            else if (SwfSoundFormats.IsDecodedInternally(head.StreamFormat))
+            {
+                int channels = head.StreamIsStereo ? 2 : 1;
+                List<float> samples = new List<float>();
+
+                for (int i = 0; i < state.Blocks.Count; i++)
+                {
+                    SwfDecodedSound decoded = SwfSoundDecoder.Decode(
+                        state.Blocks[i].Data,
+                        head.StreamFormat,
+                        head.StreamSampleRate,
+                        head.StreamIs16Bit,
+                        head.StreamIsStereo);
+
+                    if (decoded.HasSamples)
+                        samples.AddRange(decoded.Samples);
+
+                    if ((i & 7) == 7)
+                        yield return null;
+                }
+
+                if (samples.Count > 0)
+                {
+                    state.Clip = CreateClip(
+                        "SWF Sprite Stream " + state.SpriteId,
+                        new SwfDecodedSound
+                        {
+                            Samples = samples.ToArray(),
+                            Channels = channels,
+                            SampleRate = head.StreamSampleRate
+                        });
+                    state.Source.clip = state.Clip;
+                }
+            }
+
+            state.Loading = false;
+        }
+
+        private static void SyncSpriteStreamSource(
+            SpriteStreamState state,
+            int frameIndex,
+            bool playing)
+        {
+            AudioSource source = state.Source;
+
+            if (source == null || state.Clip == null)
+                return;
+
+            if (!playing)
+            {
+                if (source.isPlaying)
+                    source.Pause();
+
+                return;
+            }
+
+            int relativeFrame = frameIndex - state.FirstFrame;
+
+            if (relativeFrame < 0)
+            {
+                if (source.isPlaying)
+                    source.Stop();
+
+                return;
+            }
+
+            float target = state.SecondsPerFrame > 0f
+                ? relativeFrame * state.SecondsPerFrame
+                : 0f;
+
+            if (target >= state.Clip.length)
+            {
+                if (source.isPlaying)
+                    source.Stop();
+
+                return;
+            }
+
+            if (!source.isPlaying)
+            {
+                source.time = target;
+                source.Play();
+                return;
+            }
+
+            if (state.SecondsPerFrame > 0f &&
+                Mathf.Abs(source.time - target) > state.SecondsPerFrame * 2f)
+            {
+                source.time = target;
+            }
+        }
+
         // ---- event sounds -----------------------------------------------------
 
         public bool PlayExported(string exportName)
@@ -343,10 +570,19 @@ namespace OpenSWFUnity.Runtime.Audio
 
             if (!clipsById.TryGetValue(soundId, out AudioClip clip) || clip == null)
             {
-                // Still decoding: remember the request so it fires once ready.
-                if (IsLoading)
+                if (soundsById.TryGetValue(soundId, out DefineSoundTag sound) &&
+                    SwfSoundFormats.IsDecodedByUnity(sound.SoundFormat))
                 {
-                    pendingSoundIds.Add(soundId);
+                    if (info == null || !info.SyncNoMultiple || !HasPendingSound(soundId))
+                    {
+                        pendingSounds.Add(new PendingSoundRequest
+                        {
+                            SoundId = soundId,
+                            Info = info
+                        });
+                    }
+
+                    QueueUnityDecodedSound(sound);
                     return true;
                 }
 
@@ -361,11 +597,25 @@ namespace OpenSWFUnity.Runtime.Audio
             voice.SoundId = soundId;
             voice.InUse = true;
             voice.Source.clip = clip;
-            voice.Source.loop = info != null && info.EffectiveLoopCount > 1;
+            int loopCount = info != null ? info.EffectiveLoopCount : 1;
+            voice.Source.loop = loopCount > 1;
             voice.Source.volume = ResolveVolume(info);
             voice.Source.panStereo = ResolvePan(info);
             voice.Source.time = ResolveStartTime(info, clip);
+            float startTime = voice.Source.time;
             voice.Source.Play();
+
+            if (loopCount > 1)
+            {
+                // AudioSource.loop by itself is infinite. SWF SOUNDINFO loops are a
+                // finite count; scheduling the stop on Unity's DSP clock keeps it
+                // exact even if vector rasterization stalls the main thread.
+                double firstPlaySeconds = Mathf.Max(0.001f, clip.length - startTime);
+                double totalSeconds = firstPlaySeconds +
+                    Mathf.Max(0, loopCount - 1) * (double)clip.length;
+                voice.Source.SetScheduledEndTime(AudioSettings.dspTime + totalSeconds);
+            }
+
             return true;
         }
 
@@ -447,10 +697,10 @@ namespace OpenSWFUnity.Runtime.Audio
         // Stops only the voices carrying this sound, leaving everything else audible.
         public void StopSound(ushort soundId)
         {
-            for (int i = pendingSoundIds.Count - 1; i >= 0; i--)
+            for (int i = pendingSounds.Count - 1; i >= 0; i--)
             {
-                if (pendingSoundIds[i] == soundId)
-                    pendingSoundIds.RemoveAt(i);
+                if (pendingSounds[i].SoundId == soundId)
+                    pendingSounds.RemoveAt(i);
             }
 
             if (voices == null)
@@ -478,7 +728,14 @@ namespace OpenSWFUnity.Runtime.Audio
             }
 
             StopStream();
-            pendingSoundIds.Clear();
+
+            foreach (SpriteStreamState state in spriteStreams.Values)
+            {
+                if (state.Source != null)
+                    state.Source.Stop();
+            }
+
+            pendingSounds.Clear();
         }
 
         public void SetVolume(float volume)
@@ -518,32 +775,59 @@ namespace OpenSWFUnity.Runtime.Audio
 
         // ---- Unity-decoded formats -------------------------------------------
 
-        private IEnumerator LoadUnityDecodedSounds(List<DefineSoundTag> sounds)
+        private void QueueUnityDecodedSound(DefineSoundTag sound)
         {
+            if (sound == null || !queuedUnitySoundIds.Add(sound.SoundId))
+                return;
+
+            unityDecodeQueue.Enqueue(sound);
             IsLoading = true;
 
-            if (sounds != null)
+            if (loadingCoroutine == null)
+                loadingCoroutine = StartCoroutine(LoadQueuedUnitySounds());
+        }
+
+        private IEnumerator LoadQueuedUnitySounds()
+        {
+            while (unityDecodeQueue.Count > 0)
             {
-                for (int i = 0; i < sounds.Count; i++)
+                DefineSoundTag sound = unityDecodeQueue.Dequeue();
+                bool decoded = false;
+
+                if (sound != null && sound.SoundData != null && sound.SoundData.Length > 0)
                 {
-                    DefineSoundTag sound = sounds[i];
-
-                    if (sound == null || !SwfSoundFormats.IsDecodedByUnity(sound.SoundFormat) ||
-                        sound.SoundData == null || sound.SoundData.Length == 0)
-                    {
-                        continue;
-                    }
-
                     yield return LoadClipFromBytes(
                         sound.SoundData,
                         "openswf_sound_" + sound.SoundId + ".mp3",
                         clip =>
                         {
+                            decoded = true;
                             clip.name = "SWF Sound " + sound.SoundId;
                             clipsById[sound.SoundId] = clip;
-                            PlayPending(sound.SoundId);
                         });
                 }
+
+                if (sound != null)
+                {
+                    queuedUnitySoundIds.Remove(sound.SoundId);
+
+                    if (decoded)
+                    {
+                        PlayPending(sound.SoundId);
+                    }
+                    else
+                    {
+                        for (int i = pendingSounds.Count - 1; i >= 0; i--)
+                        {
+                            if (pendingSounds[i].SoundId == sound.SoundId)
+                                pendingSounds.RemoveAt(i);
+                        }
+                    }
+                }
+
+                // Keep multiple first-use decodes from beginning on the same frame.
+                if (unityDecodeQueue.Count > 0)
+                    yield return null;
             }
 
             IsLoading = false;
@@ -585,14 +869,30 @@ namespace OpenSWFUnity.Runtime.Audio
 
         private void PlayPending(ushort soundId)
         {
-            for (int i = pendingSoundIds.Count - 1; i >= 0; i--)
+            for (int i = 0; i < pendingSounds.Count;)
             {
-                if (pendingSoundIds[i] != soundId)
-                    continue;
+                PendingSoundRequest pending = pendingSounds[i];
 
-                pendingSoundIds.RemoveAt(i);
-                PlaySound(soundId);
+                if (pending.SoundId != soundId)
+                {
+                    i++;
+                    continue;
+                }
+
+                pendingSounds.RemoveAt(i);
+                PlaySound(soundId, pending.Info);
             }
+        }
+
+        private bool HasPendingSound(ushort soundId)
+        {
+            for (int i = 0; i < pendingSounds.Count; i++)
+            {
+                if (pendingSounds[i].SoundId == soundId)
+                    return true;
+            }
+
+            return false;
         }
 
         private void ClearLoadedAudio()
@@ -609,6 +909,15 @@ namespace OpenSWFUnity.Runtime.Audio
             {
                 Destroy(streamClip);
                 streamClip = null;
+            }
+
+            foreach (SpriteStreamState state in spriteStreams.Values)
+            {
+                if (state.Clip != null)
+                    Destroy(state.Clip);
+
+                if (state.Source != null)
+                    Destroy(state.Source);
             }
 
             for (int i = 0; i < temporaryFiles.Count; i++)
@@ -632,7 +941,7 @@ namespace OpenSWFUnity.Runtime.Audio
             return "SWF audio: decodedClips=" + clipsById.Count +
                    " activeVoices=" + ActiveVoiceCount +
                    " stream=" + (streamClip != null ? streamClip.length.ToString("0.00") + "s" : "none") +
-                   " pending=" + pendingSoundIds.Count +
+                   " pending=" + pendingSounds.Count +
                    (parser != null && parser.UnsupportedSoundFormats.Count > 0
                        ? " unsupportedFormats=" + parser.UnsupportedSoundFormats.Count
                        : string.Empty);

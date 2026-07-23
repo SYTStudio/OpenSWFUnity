@@ -28,9 +28,13 @@ namespace OpenSWFUnity.Runtime.Parser
         public byte[] JpegTables { get; private set; }
 
         public System.Collections.Generic.List<DefineShapeTag> Shapes { get; private set; } = new System.Collections.Generic.List<DefineShapeTag>();
+        public bool LazyShapeParsing { get; set; } = true;
+        private readonly Dictionary<ushort, DeferredShapeInfo> deferredShapes =
+            new Dictionary<ushort, DeferredShapeInfo>();
         public System.Collections.Generic.List<PlaceObject2Tag> PlacedObjects { get; private set; } = new System.Collections.Generic.List<PlaceObject2Tag>();
         public System.Collections.Generic.List<DefineSpriteTag> Sprites { get; private set; } = new System.Collections.Generic.List<DefineSpriteTag>();
         public System.Collections.Generic.List<DefineTextTag> Texts { get; private set; } = new System.Collections.Generic.List<DefineTextTag>();
+        public List<DefineEditTextTag> EditTexts { get; private set; } = new List<DefineEditTextTag>();
         public System.Collections.Generic.List<DefineFont3Tag> Fonts3 { get; private set; } = new System.Collections.Generic.List<DefineFont3Tag>();
         public List<DefineButton2Tag> Buttons2 { get; private set; } = new List<DefineButton2Tag>();
         public List<DefineSoundTag> Sounds { get; private set; } = new List<DefineSoundTag>();
@@ -46,6 +50,11 @@ namespace OpenSWFUnity.Runtime.Parser
         public readonly HashSet<int> UnsupportedSoundFormats = new HashSet<int>();
         public Dictionary<string, ushort> ExportedAssets { get; private set; } = new Dictionary<string, ushort>();
         public List<SwfFrame> RootFrames { get; private set; } = new List<SwfFrame>();
+        // SWF 9+ may store root timeline labels in
+        // DefineSceneAndFrameLabelData (tag 86) instead of individual FrameLabel
+        // tags. Values are zero-based frame indices, matching the tag format.
+        public Dictionary<string, int> RootFrameLabels { get; private set; } =
+            new Dictionary<string, int>(StringComparer.Ordinal);
         public List<SwfInitAction> InitActions { get; private set; } = new List<SwfInitAction>();
         public List<SwfDoAbcBlock> DoAbcBlocks { get; private set; } = new List<SwfDoAbcBlock>();
 
@@ -56,6 +65,23 @@ namespace OpenSWFUnity.Runtime.Parser
         public bool HasScriptLimits { get; private set; }
         public ushort ScriptMaxRecursionDepth { get; private set; }
         public ushort ScriptTimeoutSeconds { get; private set; }
+
+        // File-level declarations and descriptive metadata. These tags do not draw
+        // anything themselves, but exposing them keeps the parser honest and lets
+        // the runtime choose the correct VM/security behaviour without guessing.
+        public bool HasFileAttributes { get; private set; }
+        public bool UsesDirectBlit { get; private set; }
+        public bool UsesGpu { get; private set; }
+        public bool DeclaresMetadata { get; private set; }
+        public bool DeclaresActionScript3 { get; private set; }
+        public bool UsesNetwork { get; private set; }
+        public string MetadataXml { get; private set; }
+        public Dictionary<ushort, string> FontDisplayNames { get; private set; } =
+            new Dictionary<ushort, string>();
+        public Dictionary<ushort, SwfFontAlignZones> FontAlignZones { get; private set; } =
+            new Dictionary<ushort, SwfFontAlignZones>();
+        public Dictionary<ushort, SwfCsmTextSettings> CsmTextSettings { get; private set; } =
+            new Dictionary<ushort, SwfCsmTextSettings>();
 
 
         public int DefineFontCount;
@@ -97,7 +123,6 @@ namespace OpenSWFUnity.Runtime.Parser
             {
                 throw new Exception("Unsupported SWF signature: " + signature);
             }
-
             position = 8;
 
             RectInfo rect = ReadRect(position);
@@ -377,13 +402,14 @@ namespace OpenSWFUnity.Runtime.Parser
 
         public DefineBitmapTag FindBitmapById(ushort id)
         {
-            for (int i = 0; i < Bitmaps.Count; i++)
+            if (bitmapIndex == null)
             {
-                if (Bitmaps[i].CharacterId == id)
-                    return Bitmaps[i];
+                bitmapIndex = new Dictionary<ushort, DefineBitmapTag>(Bitmaps.Count);
+                for (int i = 0; i < Bitmaps.Count; i++)
+                    bitmapIndex[Bitmaps[i].CharacterId] = Bitmaps[i];
             }
 
-            return null;
+            return bitmapIndex.TryGetValue(id, out DefineBitmapTag bitmap) ? bitmap : null;
         }
 
         private byte[] DecompressCws(byte[] compressedSwf)
@@ -583,6 +609,25 @@ namespace OpenSWFUnity.Runtime.Parser
                 }
             }
 
+            if (tag.Code == 69 && tag.Length >= 4) // FileAttributes
+            {
+                uint flags = ReadUInt32LEAt(tag.DataStart);
+                HasFileAttributes = true;
+                UsesNetwork = (flags & 0x01u) != 0;
+                DeclaresActionScript3 = (flags & 0x08u) != 0;
+                DeclaresMetadata = (flags & 0x10u) != 0;
+                UsesGpu = (flags & 0x20u) != 0;
+                UsesDirectBlit = (flags & 0x40u) != 0;
+            }
+
+            if (tag.Code == 77) // Metadata
+            {
+                int metadataPosition = tag.DataStart;
+                MetadataXml = ReadNullTerminatedString(
+                    ref metadataPosition,
+                    tag.DataStart + tag.Length);
+            }
+
             if (tag.Code == 59)
             {
                 ParseDoInitAction(tag);
@@ -591,6 +636,11 @@ namespace OpenSWFUnity.Runtime.Parser
             if (tag.Code == 82)
             {
                 ParseDoAbc(tag);
+            }
+
+            if (tag.Code == 86)
+            {
+                ParseDefineSceneAndFrameLabelData(tag);
             }
 
             if (tag.Code == 2 || tag.Code == 22 || tag.Code == 32 || tag.Code == 83)
@@ -658,19 +708,43 @@ namespace OpenSWFUnity.Runtime.Parser
                 ParseDefineSprite(tag);
             }
 
-            if (tag.Code == 11)
+            if (tag.Code == 11 || tag.Code == 33)
             {
                 ParseDefineText(tag);
             }
 
-            if (tag.Code == 75)
+            if (tag.Code == 37)
+            {
+                ParseDefineEditText(tag);
+            }
+            // DefineFont2 and DefineFont3 share the same header, offset table and
+            // code-table layout. We currently need the code table to turn static
+            // text glyph indices back into Unicode; ignoring tag 48 made SWF8 HUD
+            // labels render as "Missing Font" even though the font was embedded.
+            if (tag.Code == 48 || tag.Code == 75)
             {
                 ParseDefineFont3(tag);
+            }
+
+            if (tag.Code == 88)
+            {
+                ParseDefineFontName(tag);
+            }
+
+            if (tag.Code == 73)
+            {
+                ParseDefineFontAlignZones(tag);
+            }
+
+            if (tag.Code == 74)
+            {
+                ParseCsmTextSettings(tag);
             }
 
             if (tag.Code == 46)
             {
                 DefineMorphShapeCount++;
+                ParseDefineMorphShapeFallback(tag);
 
                 if (VerboseLogging)
                 {
@@ -686,6 +760,7 @@ namespace OpenSWFUnity.Runtime.Parser
             if (tag.Code == 84)
             {
                 DefineMorphShape2Count++;
+                ParseDefineMorphShapeFallback(tag);
 
                 if (VerboseLogging)
                 {
@@ -871,6 +946,32 @@ namespace OpenSWFUnity.Runtime.Parser
 
                     // Add normal control tags to current frame.
                     currentFrame.ControlTags.Add(innerTag);
+
+                    if (innerCode == 18 || innerCode == 45)
+                    {
+                        SwfSoundStreamHead streamHead =
+                            ParseSoundStreamHeadFromTag(innerTag);
+
+                        if (streamHead != null &&
+                            (streamHead.SamplesPerFrame > 0 || sprite.SoundStreamHead == null))
+                        {
+                            sprite.SoundStreamHead = streamHead;
+
+                            if (!Audio.SwfSoundFormats.IsSupported(streamHead.StreamFormat))
+                                UnsupportedSoundFormats.Add(streamHead.StreamFormat);
+                        }
+                    }
+                    else if (innerCode == 19)
+                    {
+                        SwfSoundStreamBlock streamBlock =
+                            ParseSoundStreamBlockFromTag(
+                                innerTag,
+                                sprite.SoundStreamHead,
+                                sprite.Frames.Count);
+
+                        if (streamBlock != null)
+                            sprite.SoundStreamBlocks.Add(streamBlock);
+                    }
 
                     p += innerLength;
                 }
@@ -1091,27 +1192,10 @@ namespace OpenSWFUnity.Runtime.Parser
         {
             try
             {
-                int p = tag.DataStart;
-                byte playbackFlags = data[p++];
-                byte streamFlags = data[p++];
+                SwfSoundStreamHead head = ParseSoundStreamHeadFromTag(tag);
 
-                SwfSoundStreamHead head = new SwfSoundStreamHead
-                {
-                    PlaybackSampleRate = GetSoundSampleRate((playbackFlags >> 2) & 0x03),
-                    PlaybackIs16Bit = (playbackFlags & 0x02) != 0,
-                    PlaybackIsStereo = (playbackFlags & 0x01) != 0,
-                    StreamFormat = (streamFlags >> 4) & 0x0F,
-                    StreamSampleRate = GetSoundSampleRate((streamFlags >> 2) & 0x03),
-                    StreamIs16Bit = (streamFlags & 0x02) != 0,
-                    StreamIsStereo = (streamFlags & 0x01) != 0,
-                    SamplesPerFrame = ReadUInt16LEAt(p)
-                };
-
-                p += 2;
-
-                // Only the MP3 form carries a latency seek value.
-                if (head.StreamFormat == 2 && p + 2 <= tag.DataStart + tag.Length)
-                    head.LatencySeek = (short)ReadUInt16LEAt(p);
+                if (head == null)
+                    return;
 
                 // A head with no samples per frame declares "no stream follows", which
                 // authoring tools emit routinely; keep the first real one.
@@ -1137,30 +1221,11 @@ namespace OpenSWFUnity.Runtime.Parser
         {
             try
             {
-                int p = tag.DataStart;
-                int end = tag.DataStart + tag.Length;
-                SwfSoundStreamBlock block = new SwfSoundStreamBlock
-                {
-                    FrameIndex = RootFrames.Count
-                };
+                SwfSoundStreamBlock block = ParseSoundStreamBlockFromTag(
+                    tag, SoundStreamHead, RootFrames.Count);
 
-                // MP3 blocks prefix the frames with a sample count and a seek offset.
-                if (SoundStreamHead != null && SoundStreamHead.StreamFormat == 2 && p + 4 <= end)
-                {
-                    block.SampleCount = ReadUInt16LEAt(p);
-                    p += 2;
-                    block.SeekSamples = (short)ReadUInt16LEAt(p);
-                    p += 2;
-                }
-
-                int length = Math.Max(0, end - p);
-
-                if (length == 0)
-                    return;
-
-                block.Data = new byte[length];
-                Array.Copy(data, p, block.Data, 0, length);
-                SoundStreamBlocks.Add(block);
+                if (block != null)
+                    SoundStreamBlocks.Add(block);
             }
             catch (Exception e)
             {
@@ -1423,32 +1488,30 @@ namespace OpenSWFUnity.Runtime.Parser
                     p += 1;
                 }
 
-                SwfShapeData shapeData = ParseShapeStylesOnly(
-                    characterId,
-                    p,
-                    shapeVersion,
-                    out int afterStyles
-                );
-
-                ParseShapeRecords(shapeData, afterStyles);
-
-                BuildEdgesFromPaths(shapeData);
-                BuildFillEdgeGroups(shapeData);
-                BuildFillContours(shapeData);
-
                 DefineShapeTag shape = new DefineShapeTag
                 {
                     CharacterId = characterId,
-                    ShapeBounds = bounds,
-                    ShapeData = shapeData
+                    ShapeBounds = bounds
                 };
-
                 Shapes.Add(shape);
 
-                if (VerboseLogging)
+                if (LazyShapeParsing)
                 {
-                    Debug.Log(shape.ToString());
-                    Debug.Log(shapeData.ToString());
+                    deferredShapes[characterId] = new DeferredShapeInfo
+                    {
+                        Shape = shape,
+                        StylesOffset = p,
+                        ShapeVersion = shapeVersion
+                    };
+                }
+                else
+                {
+                    ParseDeferredShape(new DeferredShapeInfo
+                    {
+                        Shape = shape,
+                        StylesOffset = p,
+                        ShapeVersion = shapeVersion
+                    });
                 }
             }
             catch (System.Exception e)
@@ -1456,6 +1519,255 @@ namespace OpenSWFUnity.Runtime.Parser
                 if (DiagnosticsLogging)
                     Debug.LogWarning("Failed to parse DefineShape at " + tag.DataStart + ": " + e.Message);
             }
+        }
+
+        // Morph shapes contain two complete outlines and paired styles. Until the
+        // renderer can interpolate every edge at PlaceObject.Ratio, retain the
+        // start outline as a normal shape instead of dropping the character
+        // completely. This is deterministic for ratio zero and gives every SWF a
+        // useful fallback without relying on movie-specific character ids.
+        private void ParseDefineMorphShapeFallback(SwfTag tag)
+        {
+            try
+            {
+                int end = tag.DataStart + tag.Length;
+                int p = tag.DataStart;
+                if (p + 2 > end)
+                    throw new Exception("truncated character id");
+
+                ushort characterId = ReadUInt16LEAt(p);
+                p += 2;
+
+                SwfRect startBounds = ReadRectAt(p, out p);
+                ReadRectAt(p, out p); // EndBounds
+
+                bool morphShape2 = tag.Code == 84;
+                if (morphShape2)
+                {
+                    ReadRectAt(p, out p); // StartEdgeBounds
+                    ReadRectAt(p, out p); // EndEdgeBounds
+                    if (p >= end)
+                        throw new Exception("truncated MorphShape2 flags");
+                    p++; // reserved + UsesNonScalingStrokes + UsesScalingStrokes
+                }
+
+                if (p + 4 > end)
+                    throw new Exception("truncated EndEdgesOffset");
+                p += 4; // EndEdgesOffset; parsing advances through start data itself.
+
+                SwfShapeData shapeData = new SwfShapeData
+                {
+                    CharacterId = characterId,
+                    // All morph colours are RGBA. MorphShape2 additionally uses
+                    // LINESTYLE2, matching the regular shape v4 representation.
+                    ShapeVersion = morphShape2 ? 4 : 3
+                };
+
+                int fillCount = ReadExtendedStyleCount(ref p, end);
+                shapeData.FillStyleCount = fillCount;
+                for (int i = 0; i < fillCount; i++)
+                    p = ReadMorphFillStyleStart(p, end, shapeData);
+
+                int lineCount = ReadExtendedStyleCount(ref p, end);
+                shapeData.LineStyleCount = lineCount;
+                for (int i = 0; i < lineCount; i++)
+                {
+                    p = morphShape2
+                        ? ReadMorphLineStyle2Start(p, end, shapeData)
+                        : ReadMorphLineStyleStart(p, end, shapeData);
+                }
+
+                if (p >= end)
+                    throw new Exception("missing StartEdges");
+
+                SwfBitReader edgeHeader = new SwfBitReader(data, p);
+                shapeData.NumFillBits = (int)edgeHeader.ReadUBits(4);
+                shapeData.NumLineBits = (int)edgeHeader.ReadUBits(4);
+                edgeHeader.AlignToByte();
+
+                ParseShapeRecords(shapeData, edgeHeader.BytePosition);
+                BuildEdgesFromPaths(shapeData);
+                BuildFillEdgeGroups(shapeData);
+                BuildFillContours(shapeData);
+
+                Shapes.Add(new DefineShapeTag
+                {
+                    CharacterId = characterId,
+                    ShapeBounds = startBounds,
+                    ShapeData = shapeData
+                });
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                {
+                    Debug.LogWarning(
+                        "Failed to parse " + SwfTagNames.GetName(tag.Code) +
+                        " start shape at " + tag.DataStart + ": " + e.Message);
+                }
+            }
+        }
+
+        private int ReadExtendedStyleCount(ref int p, int end)
+        {
+            if (p >= end)
+                throw new Exception("truncated style count");
+
+            int count = data[p++];
+            if (count == 0xFF)
+            {
+                if (p + 2 > end)
+                    throw new Exception("truncated extended style count");
+                count = ReadUInt16LEAt(p);
+                p += 2;
+            }
+
+            return count;
+        }
+
+        private int ReadMorphFillStyleStart(int p, int end, SwfShapeData shapeData)
+        {
+            if (p >= end)
+                throw new Exception("truncated morph fill style");
+
+            SwfFillStyle fill = new SwfFillStyle { FillType = data[p++] };
+            switch (fill.FillType)
+            {
+                case 0x00:
+                    EnsureTagBytes(p, 8, end, "morph solid colours");
+                    fill.R = data[p];
+                    fill.G = data[p + 1];
+                    fill.B = data[p + 2];
+                    fill.A = data[p + 3];
+                    p += 8; // start RGBA + end RGBA
+                    break;
+
+                case 0x10:
+                case 0x12:
+                case 0x13:
+                    fill.GradientMatrix = ReadMatrixAt(p, out p);
+                    ReadMatrixAt(p, out p); // EndGradientMatrix
+                    EnsureTagBytes(p, 1, end, "morph gradient count");
+                    // SWF 8+ packs SpreadMode and InterpolationMode into the high
+                    // nibble, just like GRADIENT. Only the low nibble is a count.
+                    int gradientCount = data[p++] & 0x0F;
+                    fill.GradientStops = new List<SwfGradientStop>(gradientCount);
+                    for (int i = 0; i < gradientCount; i++)
+                    {
+                        EnsureTagBytes(p, 10, end, "morph gradient record");
+                        byte startRatio = data[p++];
+                        byte r = data[p++];
+                        byte g = data[p++];
+                        byte b = data[p++];
+                        byte a = data[p++];
+                        p += 5; // end ratio + end RGBA
+                        fill.GradientStops.Add(new SwfGradientStop
+                        {
+                            Ratio = startRatio,
+                            Color = new Color(r / 255f, g / 255f, b / 255f, a / 255f)
+                        });
+                    }
+
+                    if (fill.FillType == 0x13)
+                    {
+                        EnsureTagBytes(p, 4, end, "morph focal points");
+                        fill.FocalPoint = (short)ReadUInt16LEAt(p) / 256f;
+                        p += 4; // start + end FIXED8
+                    }
+                    break;
+
+                case 0x40:
+                case 0x41:
+                case 0x42:
+                case 0x43:
+                    EnsureTagBytes(p, 2, end, "morph bitmap id");
+                    fill.BitmapId = ReadUInt16LEAt(p);
+                    p += 2;
+                    fill.BitmapMatrix = ReadMatrixAt(p, out p);
+                    ReadMatrixAt(p, out p); // EndBitmapMatrix
+                    fill.BitmapSmoothed = fill.FillType == 0x40 || fill.FillType == 0x41;
+                    fill.BitmapClipped = fill.FillType == 0x41 || fill.FillType == 0x43;
+                    break;
+
+                default:
+                    throw new Exception(
+                        "unknown morph fill style 0x" + fill.FillType.ToString("X2"));
+            }
+
+            shapeData.FillStyles.Add(fill);
+            return p;
+        }
+
+        private int ReadMorphLineStyleStart(int p, int end, SwfShapeData shapeData)
+        {
+            EnsureTagBytes(p, 12, end, "morph line style");
+            SwfLineStyle line = new SwfLineStyle
+            {
+                Width = ReadUInt16LEAt(p) / 20f,
+                Color = new Color(
+                    data[p + 4] / 255f,
+                    data[p + 5] / 255f,
+                    data[p + 6] / 255f,
+                    data[p + 7] / 255f)
+            };
+            p += 12; // paired widths + paired RGBA colours
+            shapeData.LineStyles.Add(line);
+            return p;
+        }
+
+        private int ReadMorphLineStyle2Start(int p, int end, SwfShapeData shapeData)
+        {
+            EnsureTagBytes(p, 6, end, "morph line style 2");
+            SwfLineStyle line = new SwfLineStyle
+            {
+                Width = ReadUInt16LEAt(p) / 20f
+            };
+            p += 4; // start + end width
+
+            SwfBitReader reader = new SwfBitReader(data, p);
+            line.StartCapStyle = (int)reader.ReadUBits(2);
+            line.JoinStyle = (int)reader.ReadUBits(2);
+            line.HasFillStyle = reader.ReadUBits(1) == 1;
+            line.NoHScale = reader.ReadUBits(1) == 1;
+            line.NoVScale = reader.ReadUBits(1) == 1;
+            line.PixelHinting = reader.ReadUBits(1) == 1;
+            reader.ReadUBits(5);
+            line.NoClose = reader.ReadUBits(1) == 1;
+            line.EndCapStyle = (int)reader.ReadUBits(2);
+            reader.AlignToByte();
+            p = reader.BytePosition;
+
+            if (line.JoinStyle == 2)
+            {
+                EnsureTagBytes(p, 2, end, "morph miter limit");
+                line.MiterLimitFactor = (short)ReadUInt16LEAt(p) / 256f;
+                p += 2;
+            }
+
+            if (line.HasFillStyle)
+            {
+                line.FillStyleIndex = shapeData.FillStyles.Count;
+                p = ReadMorphFillStyleStart(p, end, shapeData);
+            }
+            else
+            {
+                EnsureTagBytes(p, 8, end, "morph line colours");
+                line.Color = new Color(
+                    data[p] / 255f,
+                    data[p + 1] / 255f,
+                    data[p + 2] / 255f,
+                    data[p + 3] / 255f);
+                p += 8;
+            }
+
+            shapeData.LineStyles.Add(line);
+            return p;
+        }
+
+        private static void EnsureTagBytes(int p, int count, int end, string field)
+        {
+            if (p < 0 || count < 0 || p > end - count)
+                throw new Exception("truncated " + field);
         }
 
         private SwfMatrix ReadMatrixAt(int offset, out int nextBytePosition)
@@ -1516,9 +1828,11 @@ namespace OpenSWFUnity.Runtime.Parser
         // single index build replaces the repeated scans without touching parsing.
         private Dictionary<ushort, DefineShapeTag> shapeIndex;
         private Dictionary<ushort, DefineSpriteTag> spriteIndex;
+        private Dictionary<ushort, DefineBitmapTag> bitmapIndex;
         private Dictionary<ushort, DefineButton2Tag> button2Index;
         private Dictionary<ushort, DefineSoundTag> soundIndex;
         private Dictionary<ushort, DefineTextTag> textIndex;
+        private Dictionary<ushort, DefineEditTextTag> editTextIndex;
         private Dictionary<ushort, DefineFont3Tag> font3Index;
 
         public DefineShapeTag FindShapeById(ushort id)
@@ -1530,7 +1844,11 @@ namespace OpenSWFUnity.Runtime.Parser
                     shapeIndex[Shapes[i].CharacterId] = Shapes[i];
             }
 
-            return shapeIndex.TryGetValue(id, out DefineShapeTag shape) ? shape : null;
+            if (!shapeIndex.TryGetValue(id, out DefineShapeTag shape))
+                return null;
+
+            EnsureShapeParsed(shape);
+            return shape;
         }
 
         public DefineSpriteTag FindSpriteById(ushort id)
@@ -2228,6 +2546,12 @@ namespace OpenSWFUnity.Runtime.Parser
                         currentFillStyle0 = 0;
                         currentFillStyle1 = 0;
                         currentLineStyle = 0;
+
+                        // The next edge belongs to the newly installed style arrays.
+                        // Keeping the old path object here assigned every later edge
+                        // to the pre-NewStyles fill until another MoveTo/style record,
+                        // which mixed unrelated outlines into one fill graph.
+                        currentPath = null;
                     }
 
                     if (stateMoveTo)
@@ -2570,6 +2894,7 @@ namespace OpenSWFUnity.Runtime.Parser
             // to hash, and an index-keyed bucket avoids the per-edge hashing the
             // previous HashSet<SwfShapeEdge> performed on every lookup.
             Dictionary<long, List<int>> byStartCell = new Dictionary<long, List<int>>();
+            Dictionary<long, List<int>> byEndCell = new Dictionary<long, List<int>>();
 
             for (int i = 0; i < group.Edges.Count; i++)
             {
@@ -2582,6 +2907,16 @@ namespace OpenSWFUnity.Runtime.Parser
                 }
 
                 bucket.Add(i);
+
+                long endKey = PointCellKey(group.Edges[i].End);
+
+                if (!byEndCell.TryGetValue(endKey, out List<int> endBucket))
+                {
+                    endBucket = new List<int>();
+                    byEndCell[endKey] = endBucket;
+                }
+
+                endBucket.Add(i);
             }
 
             bool[] used = new bool[group.Edges.Count];
@@ -2597,6 +2932,7 @@ namespace OpenSWFUnity.Runtime.Parser
                 };
 
                 int current = i;
+                bool currentReversed = false;
                 Vector2 loopStart = group.Edges[current].Start;
                 contour.Points.Add(loopStart);
 
@@ -2606,13 +2942,39 @@ namespace OpenSWFUnity.Runtime.Parser
                 while (current >= 0 && guard++ < maxGuard)
                 {
                     used[current] = true;
-                    Vector2 tip = group.Edges[current].End;
+                    Vector2 tip = currentReversed
+                        ? group.Edges[current].Start
+                        : group.Edges[current].End;
                     contour.Points.Add(tip);
 
                     if (PointsClose(tip, loopStart))
                         break; // loop closed cleanly
 
-                    current = TakeNextForwardEdge(group, byStartCell, used, tip);
+                    Vector2 incomingDirection = tip -
+                        contour.Points[contour.Points.Count - 2];
+                    current = TakeNextForwardEdge(
+                        group,
+                        byStartCell,
+                        used,
+                        tip,
+                        incomingDirection);
+                    currentReversed = false;
+
+                    // Some authoring tools split a fill at a style-change record in
+                    // the opposite direction. Flash still welds the endpoints, while
+                    // a forward-only walk leaves hundreds of open Isaac contours.
+                    // Reverse only as a fallback, preserving normal winding whenever
+                    // a correctly directed continuation exists.
+                    if (current < 0 && AllowReverseEdgeFallback)
+                    {
+                        current = TakeNextReverseEdge(
+                            group,
+                            byEndCell,
+                            used,
+                            tip,
+                            incomingDirection);
+                        currentReversed = current >= 0;
+                    }
                 }
 
                 if (contour.Points.Count >= 3)
@@ -2641,11 +3003,14 @@ namespace OpenSWFUnity.Runtime.Parser
             SwfFillEdgeGroup group,
             Dictionary<long, List<int>> byStartCell,
             bool[] used,
-            Vector2 tip
+            Vector2 tip,
+            Vector2 incomingDirection
         )
         {
             long baseX = (long)Mathf.Round(tip.x / PointCellSize);
             long baseY = (long)Mathf.Round(tip.y / PointCellSize);
+            int bestCandidate = -1;
+            float bestTurn = float.PositiveInfinity;
 
             // Sub-tolerance rounding can drop a shared vertex into a neighbouring
             // cell, so scan the 3x3 block around the tip, not just its own cell.
@@ -2662,18 +3027,171 @@ namespace OpenSWFUnity.Runtime.Parser
                     {
                         int candidate = bucket[i];
 
-                        if (!used[candidate] && PointsClose(group.Edges[candidate].Start, tip))
-                            return candidate;
+                        if (used[candidate] ||
+                            !PointsClose(group.Edges[candidate].Start, tip))
+                        {
+                            continue;
+                        }
+
+                        Vector2 outgoingDirection =
+                            group.Edges[candidate].End - group.Edges[candidate].Start;
+                        float turn = RightSideTurn(incomingDirection, outgoingDirection);
+
+                        if (turn < bestTurn)
+                        {
+                            bestTurn = turn;
+                            bestCandidate = candidate;
+                        }
                     }
                 }
             }
 
-            return -1;
+            return bestCandidate;
+        }
+
+        private void ParseDefineSceneAndFrameLabelData(SwfTag tag)
+        {
+            int p = tag.DataStart;
+            int end = tag.DataStart + tag.Length;
+
+            try
+            {
+                uint sceneCount = ReadEncodedU32(ref p, end);
+
+                for (uint i = 0; i < sceneCount; i++)
+                {
+                    // Scene offsets and names are useful to scene APIs, but AVM1
+                    // gotoLabel resolves against the frame-label table below.
+                    ReadEncodedU32(ref p, end);
+                    ReadNullTerminatedString(ref p, end);
+                }
+
+                uint frameLabelCount = ReadEncodedU32(ref p, end);
+
+                for (uint i = 0; i < frameLabelCount; i++)
+                {
+                    uint frameNumber = ReadEncodedU32(ref p, end);
+                    string label = ReadNullTerminatedString(ref p, end);
+
+                    if (!string.IsNullOrEmpty(label))
+                    {
+                        RootFrameLabels[label] = frameNumber > int.MaxValue
+                            ? int.MaxValue
+                            : (int)frameNumber;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                {
+                    Debug.LogWarning(
+                        "Failed to parse DefineSceneAndFrameLabelData at " +
+                        tag.DataStart + ": " + e.Message
+                    );
+                }
+            }
+        }
+
+        private uint ReadEncodedU32(ref int p, int end)
+        {
+            uint value = 0;
+
+            for (int byteIndex = 0; byteIndex < 5; byteIndex++)
+            {
+                if (p >= end)
+                    throw new EndOfStreamException("Truncated EncodedU32 value.");
+
+                byte current = data[p++];
+
+                if (byteIndex == 4)
+                {
+                    // EncodedU32 has at most 32 payload bits. Only the low four
+                    // bits of a fifth byte belong to the value.
+                    value |= (uint)(current & 0x0F) << 28;
+
+                    if ((current & 0x80) != 0 || (current & 0x70) != 0)
+                        throw new InvalidDataException("EncodedU32 value is too large.");
+
+                    return value;
+                }
+
+                value |= (uint)(current & 0x7F) << (byteIndex * 7);
+
+                if ((current & 0x80) == 0)
+                    return value;
+            }
+
+            throw new InvalidDataException("Invalid EncodedU32 value.");
+        }
+
+        private int TakeNextReverseEdge(
+            SwfFillEdgeGroup group,
+            Dictionary<long, List<int>> byEndCell,
+            bool[] used,
+            Vector2 tip,
+            Vector2 incomingDirection)
+        {
+            long baseX = (long)Mathf.Round(tip.x / PointCellSize);
+            long baseY = (long)Mathf.Round(tip.y / PointCellSize);
+            int bestCandidate = -1;
+            float bestTurn = float.PositiveInfinity;
+
+            for (long oy = -1; oy <= 1; oy++)
+            {
+                for (long ox = -1; ox <= 1; ox++)
+                {
+                    long key = CellKey(baseX + ox, baseY + oy);
+
+                    if (!byEndCell.TryGetValue(key, out List<int> bucket))
+                        continue;
+
+                    for (int i = 0; i < bucket.Count; i++)
+                    {
+                        int candidate = bucket[i];
+
+                        if (!used[candidate] &&
+                            PointsClose(group.Edges[candidate].End, tip))
+                        {
+                            Vector2 outgoingDirection =
+                                group.Edges[candidate].Start - group.Edges[candidate].End;
+                            float turn = RightSideTurn(incomingDirection, outgoingDirection);
+
+                            if (turn < bestTurn)
+                            {
+                                bestTurn = turn;
+                                bestCandidate = candidate;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return bestCandidate;
+        }
+
+        private static float RightSideTurn(Vector2 incoming, Vector2 outgoing)
+        {
+            if (incoming.sqrMagnitude <= 0.0000001f ||
+                outgoing.sqrMagnitude <= 0.0000001f)
+            {
+                return float.PositiveInfinity;
+            }
+
+            // SWF coordinates have Y pointing down. For edges oriented with their
+            // fill on the right, the correct continuation at a shared vertex is the
+            // smallest positive turn in this coordinate system. Selecting the first
+            // edge in file order crossed unrelated lobes whenever several contours
+            // touched the same point, producing self-intersections and giant fans.
+            float incomingAngle = Mathf.Atan2(incoming.y, incoming.x);
+            float outgoingAngle = Mathf.Atan2(outgoing.y, outgoing.x);
+            return Mathf.Repeat(outgoingAngle - incomingAngle, Mathf.PI * 2f);
         }
 
         // Vertex-welding grid for edge stitching. Matches the PointsClose radius so
         // two endpoints that count as "the same" always land within a 3x3 lookup.
         private const float PointCellSize = 0.5f;
+        private const bool AllowReverseEdgeFallback = true;
 
         private static long PointCellKey(Vector2 p)
         {
@@ -2780,7 +3298,7 @@ namespace OpenSWFUnity.Runtime.Parser
                     AdvanceBits = advanceBits
                 };
 
-                ParseTextRecords(text, p, tag.DataStart + tag.Length);
+                ParseTextRecords(text, p, tag.DataStart + tag.Length, tag.Code == 33);
 
                 Texts.Add(text);
 
@@ -2827,7 +3345,191 @@ namespace OpenSWFUnity.Runtime.Parser
             }
         }
 
-        private void ParseTextRecords(DefineTextTag text, int offset, int end)
+        private void ParseDeferredShape(DeferredShapeInfo deferred)
+        {
+            if (deferred?.Shape == null || deferred.Shape.ShapeData != null)
+                return;
+
+            SwfShapeData shapeData = ParseShapeStylesOnly(
+                deferred.Shape.CharacterId,
+                deferred.StylesOffset,
+                deferred.ShapeVersion,
+                out int afterStyles);
+            ParseShapeRecords(shapeData, afterStyles);
+            BuildEdgesFromPaths(shapeData);
+            BuildFillEdgeGroups(shapeData);
+            BuildFillContours(shapeData);
+            deferred.Shape.ShapeData = shapeData;
+
+            if (VerboseLogging)
+            {
+                Debug.Log(deferred.Shape.ToString());
+                Debug.Log(shapeData.ToString());
+            }
+        }
+
+        public void EnsureAllShapesParsed()
+        {
+            for (int i = 0; i < Shapes.Count; i++)
+                EnsureShapeParsed(Shapes[i]);
+        }
+
+        private void EnsureShapeParsed(DefineShapeTag shape)
+        {
+            if (shape == null || shape.ShapeData != null)
+                return;
+
+            if (!deferredShapes.TryGetValue(shape.CharacterId, out DeferredShapeInfo deferred))
+                return;
+
+            try
+            {
+                ParseDeferredShape(deferred);
+                deferredShapes.Remove(shape.CharacterId);
+            }
+            catch (Exception e)
+            {
+                deferredShapes.Remove(shape.CharacterId);
+
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to lazily parse DefineShape " +
+                        shape.CharacterId + ": " + e.Message);
+            }
+        }
+
+        private SwfSoundStreamHead ParseSoundStreamHeadFromTag(SwfTag tag)
+        {
+            if (tag == null || tag.Length < 4)
+                return null;
+
+            int p = tag.DataStart;
+            byte playbackFlags = data[p++];
+            byte streamFlags = data[p++];
+            SwfSoundStreamHead head = new SwfSoundStreamHead
+            {
+                PlaybackSampleRate = GetSoundSampleRate((playbackFlags >> 2) & 0x03),
+                PlaybackIs16Bit = (playbackFlags & 0x02) != 0,
+                PlaybackIsStereo = (playbackFlags & 0x01) != 0,
+                StreamFormat = (streamFlags >> 4) & 0x0F,
+                StreamSampleRate = GetSoundSampleRate((streamFlags >> 2) & 0x03),
+                StreamIs16Bit = (streamFlags & 0x02) != 0,
+                StreamIsStereo = (streamFlags & 0x01) != 0,
+                SamplesPerFrame = ReadUInt16LEAt(p)
+            };
+            p += 2;
+
+            if (head.StreamFormat == 2 && p + 2 <= tag.DataStart + tag.Length)
+                head.LatencySeek = (short)ReadUInt16LEAt(p);
+
+            return head;
+        }
+
+        private SwfSoundStreamBlock ParseSoundStreamBlockFromTag(
+            SwfTag tag,
+            SwfSoundStreamHead head,
+            int frameIndex)
+        {
+            if (tag == null)
+                return null;
+
+            int p = tag.DataStart;
+            int end = tag.DataStart + tag.Length;
+            SwfSoundStreamBlock block = new SwfSoundStreamBlock { FrameIndex = frameIndex };
+
+            if (head != null && head.StreamFormat == 2 && p + 4 <= end)
+            {
+                block.SampleCount = ReadUInt16LEAt(p);
+                p += 2;
+                block.SeekSamples = (short)ReadUInt16LEAt(p);
+                p += 2;
+            }
+
+            int length = Math.Max(0, end - p);
+
+            if (length == 0)
+                return null;
+
+            block.Data = new byte[length];
+            Array.Copy(data, p, block.Data, 0, length);
+            return block;
+        }
+
+        private void ParseDefineEditText(SwfTag tag)
+        {
+            try
+            {
+                int p = tag.DataStart;
+                int end = tag.DataStart + tag.Length;
+                DefineEditTextTag text = new DefineEditTextTag
+                {
+                    CharacterId = ReadUInt16LEAt(p)
+                };
+                p += 2;
+                text.Bounds = ReadRectAt(p, out p);
+                text.Flags = ReadUInt16LEAt(p);
+                p += 2;
+
+                if (text.HasFont)
+                {
+                    text.FontId = ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                if (text.HasFontClass)
+                    text.FontClass = ReadNullTerminatedString(ref p, end);
+
+                if (text.HasFont)
+                {
+                    text.FontHeight = ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                if (text.HasTextColor)
+                {
+                    text.Color = new Color(
+                        data[p] / 255f,
+                        data[p + 1] / 255f,
+                        data[p + 2] / 255f,
+                        data[p + 3] / 255f
+                    );
+                    p += 4;
+                }
+
+                if (text.HasMaxLength)
+                {
+                    text.MaxLength = ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                if (text.HasLayout)
+                {
+                    text.Alignment = data[p++];
+                    text.LeftMargin = ReadUInt16LEAt(p);
+                    p += 2;
+                    text.RightMargin = ReadUInt16LEAt(p);
+                    p += 2;
+                    text.Indent = ReadUInt16LEAt(p);
+                    p += 2;
+                    text.Leading = (short)ReadUInt16LEAt(p);
+                    p += 2;
+                }
+
+                text.VariableName = ReadNullTerminatedString(ref p, end);
+
+                if (text.HasText && p < end)
+                    text.InitialText = ReadNullTerminatedString(ref p, end);
+
+                EditTexts.Add(text);
+            }
+            catch (System.Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineEditText at " +
+                        tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        private void ParseTextRecords(DefineTextTag text, int offset, int end, bool useRgba)
         {
             int p = offset;
 
@@ -2866,8 +3568,9 @@ namespace OpenSWFUnity.Runtime.Parser
                     byte r = data[p++];
                     byte g = data[p++];
                     byte b = data[p++];
+                    byte a = useRgba ? data[p++] : (byte)255;
 
-                    record.Color = new Color(r / 255f, g / 255f, b / 255f, 1f);
+                    record.Color = new Color(r / 255f, g / 255f, b / 255f, a / 255f);
                 }
 
                 if (record.HasXOffset)
@@ -2938,7 +3641,7 @@ namespace OpenSWFUnity.Runtime.Parser
                 string fontName = System.Text.Encoding.ASCII.GetString(data, p, fontNameLength);
                 p += fontNameLength;
 
-                // Important: DefineFont2/DefineFont3 has NumGlyphs here.
+                // DefineFont2/DefineFont3 has NumGlyphs here.
                 ushort numGlyphs = ReadUInt16LEAt(p);
                 p += 2;
 
@@ -2981,6 +3684,11 @@ namespace OpenSWFUnity.Runtime.Parser
                     FontName = fontName,
                     GlyphCount = numGlyphs
                 };
+                if (FontDisplayNames.TryGetValue(fontId, out string displayName) &&
+                    !string.IsNullOrEmpty(displayName))
+                {
+                    font.FontName = displayName;
+                }
 
                 p = codeTableStart;
 
@@ -3025,6 +3733,92 @@ namespace OpenSWFUnity.Runtime.Parser
             {
                 if (DiagnosticsLogging)
                     Debug.LogWarning("Failed to parse DefineFont3 at " + tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        private void ParseDefineFontName(SwfTag tag)
+        {
+            try
+            {
+                int end = tag.DataStart + tag.Length;
+                int p = tag.DataStart;
+                EnsureTagBytes(p, 2, end, "font id");
+                ushort fontId = ReadUInt16LEAt(p);
+                p += 2;
+
+                string displayName = ReadNullTerminatedString(ref p, end);
+                // Copyright string follows. It is intentionally consumed so a
+                // malformed tag is diagnosed, although it is not needed to render.
+                ReadNullTerminatedString(ref p, end);
+                FontDisplayNames[fontId] = displayName;
+
+                for (int i = 0; i < Fonts3.Count; i++)
+                {
+                    if (Fonts3[i].FontId == fontId && !string.IsNullOrEmpty(displayName))
+                        Fonts3[i].FontName = displayName;
+                }
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineFontName at " + tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        private void ParseDefineFontAlignZones(SwfTag tag)
+        {
+            try
+            {
+                int end = tag.DataStart + tag.Length;
+                int p = tag.DataStart;
+                EnsureTagBytes(p, 3, end, "font alignment zone header");
+                ushort fontId = ReadUInt16LEAt(p);
+                p += 2;
+                int csmTableHint = (data[p++] >> 6) & 0x03;
+
+                byte[] zoneTable = new byte[end - p];
+                if (zoneTable.Length > 0)
+                    Buffer.BlockCopy(data, p, zoneTable, 0, zoneTable.Length);
+
+                FontAlignZones[fontId] = new SwfFontAlignZones
+                {
+                    FontId = fontId,
+                    CsmTableHint = csmTableHint,
+                    EncodedZoneTable = zoneTable
+                };
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse DefineFontAlignZones at " + tag.DataStart + ": " + e.Message);
+            }
+        }
+
+        private void ParseCsmTextSettings(SwfTag tag)
+        {
+            try
+            {
+                int end = tag.DataStart + tag.Length;
+                int p = tag.DataStart;
+                EnsureTagBytes(p, 12, end, "CSM text settings");
+                ushort textId = ReadUInt16LEAt(p);
+                p += 2;
+                byte flags = data[p++];
+
+                SwfCsmTextSettings settings = new SwfCsmTextSettings
+                {
+                    TextId = textId,
+                    UseFlashType = (flags >> 6) & 0x01,
+                    GridFit = (flags >> 3) & 0x03,
+                    Thickness = BitConverter.ToSingle(data, p),
+                    Sharpness = BitConverter.ToSingle(data, p + 4)
+                };
+                CsmTextSettings[textId] = settings;
+            }
+            catch (Exception e)
+            {
+                if (DiagnosticsLogging)
+                    Debug.LogWarning("Failed to parse CSMTextSettings at " + tag.DataStart + ": " + e.Message);
             }
         }
 
@@ -3089,9 +3883,27 @@ namespace OpenSWFUnity.Runtime.Parser
             return textIndex.TryGetValue(id, out DefineTextTag text) ? text : null;
         }
 
+        public DefineEditTextTag FindEditTextById(ushort id)
+        {
+            if (editTextIndex == null)
+            {
+                editTextIndex = new Dictionary<ushort, DefineEditTextTag>(EditTexts.Count);
+                for (int i = 0; i < EditTexts.Count; i++)
+                    editTextIndex[EditTexts[i].CharacterId] = EditTexts[i];
+            }
+
+            return editTextIndex.TryGetValue(id, out DefineEditTextTag text) ? text : null;
+        }
         public string DecodeTextRecordPublic(SwfTextRecord record)
         {
             return DecodeTextRecord(record);
+        }
+
+        private sealed class DeferredShapeInfo
+        {
+            public DefineShapeTag Shape;
+            public int StylesOffset;
+            public int ShapeVersion;
         }
 
         private struct RectInfo

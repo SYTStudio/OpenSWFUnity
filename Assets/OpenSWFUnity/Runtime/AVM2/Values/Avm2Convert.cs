@@ -208,6 +208,21 @@ namespace OpenSWFUnity.Runtime.AVM2.Values
             if (value is Avm2Array array)
                 return ArrayToString(array);
 
+            // Error subclasses keep their useful text in __message. Avm2Object's
+            // fallback string is only "[object ReferenceError]", which hid the
+            // missing definition and made real AS3 startup failures impossible to
+            // diagnose from Unity's Console.
+            if (value is Avm2Object error &&
+                error.TryGetDynamic(Avm2QName.Public("__message"), out object message) &&
+                !IsNullOrUndefined(message))
+            {
+                string errorName = error.Class != null &&
+                                   !string.IsNullOrEmpty(error.Class.Name.Local)
+                    ? error.Class.Name.Local
+                    : "Error";
+                return errorName + ": " + ToString(message);
+            }
+
             return value.ToString();
         }
 

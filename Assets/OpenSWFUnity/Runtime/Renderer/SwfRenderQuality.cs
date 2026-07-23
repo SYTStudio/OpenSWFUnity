@@ -45,8 +45,9 @@ namespace OpenSWFUnity.Runtime.Renderer
         // glyphs sharp when the stage is scaled up.
         public int TextFontSize;
 
-        // Stencil-based masking is exact but costs an extra draw per mask. Low turns
-        // it off and falls back to drawing masked content unclipped.
+        // Stencil-based masking is part of the movie's display list, not optional
+        // eye candy. Every shipping profile keeps it enabled so quality never makes
+        // objects disappear or leak outside their intended bounds.
         public bool StencilMasks;
 
         // Cached local meshes retained before the least recently used are dropped.
@@ -115,45 +116,48 @@ namespace OpenSWFUnity.Runtime.Renderer
                     return new SwfQualitySettings
                     {
                         CurveSubdivisionSteps = 3,
-                        ContourSimplifyTolerance = 4f,
-                        RasterizationScale = 0.5f,
-                        BitmapFilter = FilterMode.Point,
+                        ContourSimplifyTolerance = 1.25f,
+                        RasterizationScale = 0.75f,
+                        BitmapFilter = FilterMode.Bilinear,
                         BitmapAnisoLevel = 0,
-                        MaxTextureSize = 256,
+                        MaxTextureSize = 1024,
                         AntiAliasing = 0,
-                        TextFontSize = 24,
-                        StencilMasks = false,
-                        MeshCacheBudget = 512
+                        TextFontSize = 32,
+                        StencilMasks = true,
+                        MeshCacheBudget = 2048
                     };
 
                 case SwfQualityLevel.Medium:
                     return new SwfQualitySettings
                     {
                         CurveSubdivisionSteps = 5,
-                        ContourSimplifyTolerance = 1.5f,
-                        RasterizationScale = 0.75f,
+                        ContourSimplifyTolerance = 0.5f,
+                        RasterizationScale = 1f,
                         BitmapFilter = FilterMode.Bilinear,
-                        BitmapAnisoLevel = 1,
-                        MaxTextureSize = 512,
-                        AntiAliasing = 2,
+                        BitmapAnisoLevel = 0,
+                        MaxTextureSize = 2048,
+                        AntiAliasing = 0,
                         TextFontSize = 48,
                         StencilMasks = true,
-                        MeshCacheBudget = 1024
+                        MeshCacheBudget = 4096
                     };
 
                 case SwfQualityLevel.Ultra:
                     return new SwfQualitySettings
                     {
-                        CurveSubdivisionSteps = 14,
+                        // Ultra keeps exact contours and source-size bitmaps, but it
+                        // no longer multiplies curve work and MSAA far beyond what a
+                        // 2D Flash stage can visibly benefit from.
+                        CurveSubdivisionSteps = 8,
                         ContourSimplifyTolerance = 0f,
-                        RasterizationScale = 2f,
-                        BitmapFilter = FilterMode.Trilinear,
-                        BitmapAnisoLevel = 8,
+                        RasterizationScale = 1.25f,
+                        BitmapFilter = FilterMode.Bilinear,
+                        BitmapAnisoLevel = 2,
                         MaxTextureSize = 4096,
-                        AntiAliasing = 8,
+                        AntiAliasing = 4,
                         TextFontSize = 96,
                         StencilMasks = true,
-                        MeshCacheBudget = 8192
+                        MeshCacheBudget = 6144
                     };
 
                 // High is the reference level and matches what the renderer produced
@@ -162,13 +166,13 @@ namespace OpenSWFUnity.Runtime.Renderer
                 default:
                     return new SwfQualitySettings
                     {
-                        CurveSubdivisionSteps = 8,
-                        ContourSimplifyTolerance = 0.5f,
+                        CurveSubdivisionSteps = 7,
+                        ContourSimplifyTolerance = 0.15f,
                         RasterizationScale = 1f,
                         BitmapFilter = FilterMode.Bilinear,
-                        BitmapAnisoLevel = 2,
+                        BitmapAnisoLevel = 1,
                         MaxTextureSize = 2048,
-                        AntiAliasing = 4,
+                        AntiAliasing = 2,
                         TextFontSize = 64,
                         StencilMasks = true,
                         MeshCacheBudget = 4096

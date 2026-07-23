@@ -385,8 +385,10 @@ namespace OpenSWFUnity.Runtime.Renderer
 
             // Reaching here with more than a triangle left means ear clipping could
             // not consume the polygon: either the guard tripped or the outline is
-            // self-intersecting. The remainder is still fanned so the shape does not
-            // vanish, but the fault is reported rather than hidden.
+            // self-intersecting. Never fan that remainder. A fan joins distant points
+            // across a broken outline and creates the huge black/grey wedges seen in
+            // complex SWFs. Keeping the valid ears is preferable to covering the
+            // stage with geometry that was never present in the movie.
             if (indices.Count > 3)
             {
                 SwfRenderDiagnostics.Report(
@@ -395,15 +397,15 @@ namespace OpenSWFUnity.Runtime.Renderer
                     groupIndex,
                     "ear clipping left " + indices.Count + " of " + n +
                     " vertices unconsumed in fill group " + groupIndex +
-                    "; the remainder was closed with a triangle fan, which can look " +
-                    "wrong on a self-intersecting outline");
+                    "; the unsafe triangle-fan remainder was discarded");
+                return;
             }
 
-            for (int i = 1; i + 1 < indices.Count; i++)
+            if (indices.Count == 3)
             {
                 outTriangles.Add(baseIndex + indices[0]);
-                outTriangles.Add(baseIndex + indices[i]);
-                outTriangles.Add(baseIndex + indices[i + 1]);
+                outTriangles.Add(baseIndex + indices[1]);
+                outTriangles.Add(baseIndex + indices[2]);
             }
         }
 

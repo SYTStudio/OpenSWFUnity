@@ -45,6 +45,7 @@ namespace OpenSWFUnity.Runtime.AVM2
             FunctionClass = DefineClass("Function", ObjectClass);
 
             DefineArrayClass();
+            DefineVectorClass();
             DefineStringClass();
             DefineNumericClasses();
             DefineMathClass();
@@ -350,6 +351,19 @@ namespace OpenSWFUnity.Runtime.AVM2
 
             DefineMethod(ArrayClass, "toString",
                 (receiver, args) => Avm2Convert.ToString(receiver));
+        }
+
+        private void DefineVectorClass()
+        {
+            Avm2Class vectorClass =
+                DefinePackageClass("__AS3__.vec", "Vector", ArrayClass, dynamic: true);
+            vectorClass.NativeConstruct = args =>
+            {
+                Avm2Array vector = new Avm2Array { Class = vectorClass };
+                if (args != null && args.Length > 0)
+                    vector.SetLength(Math.Max(0, Avm2Convert.ToInt32(args[0])));
+                return vector;
+            };
         }
 
         private static int NormaliseIndex(int index, int length)

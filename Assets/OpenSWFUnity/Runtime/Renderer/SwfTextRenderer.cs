@@ -95,6 +95,92 @@ namespace OpenSWFUnity.Runtime.Renderer
             go.transform.localPosition = unityPos;
         }
 
+        public void DrawEditText(
+            DefineEditTextTag text,
+            string value,
+            SwfMatrix worldMatrix,
+            string name,
+            float characterSize,
+            float alpha
+        )
+        {
+            if (text == null)
+                return;
+
+            TextInstance instance = AcquireInstance(name);
+            GameObject go = instance.GameObject;
+            TextMesh textMesh = instance.TextMesh;
+            textMesh.text = value ?? string.Empty;
+            int fontSize = Mathf.Max(8, SwfRenderQuality.Settings.TextFontSize);
+            float declaredPixelHeight = Mathf.Max(4f, text.FontHeight / 20f);
+            textMesh.fontSize = fontSize;
+            textMesh.characterSize = characterSize * (declaredPixelHeight / 12f) *
+                (64f / fontSize);
+            textMesh.richText = false;
+            textMesh.anchor = text.Alignment == 1
+                ? TextAnchor.UpperCenter
+                : text.Alignment == 2
+                    ? TextAnchor.UpperRight
+                    : TextAnchor.UpperLeft;
+            textMesh.alignment = text.Alignment == 1
+                ? TextAlignment.Center
+                : text.Alignment == 2
+                    ? TextAlignment.Right
+                    : TextAlignment.Left;
+            Color color = SwfRenderQuality.ToVertexColor(text.Color);
+            color.a *= alpha;
+            textMesh.color = color;
+
+            Vector3 unityPos = FlashToUnityPoint(
+                text.Bounds.XMinPixels + text.LeftMargin / 20f,
+                text.Bounds.YMinPixels,
+                worldMatrix
+            );
+
+            if (!IsFinite(unityPos))
+            {
+                go.SetActive(false);
+                return;
+            }
+
+            go.transform.localPosition = unityPos;
+        }
+
+        public void DrawRuntimeText(
+            string value,
+            SwfMatrix worldMatrix,
+            string name,
+            uint rgb,
+            float alpha
+        )
+        {
+            TextInstance instance = AcquireInstance(name);
+            GameObject go = instance.GameObject;
+            TextMesh textMesh = instance.TextMesh;
+            int fontSize = Mathf.Max(8, SwfRenderQuality.Settings.TextFontSize);
+
+            textMesh.text = value ?? string.Empty;
+            textMesh.fontSize = fontSize;
+            textMesh.characterSize = 0.055f * (64f / fontSize);
+            textMesh.richText = false;
+            textMesh.anchor = TextAnchor.UpperLeft;
+            textMesh.alignment = TextAlignment.Left;
+            textMesh.color = new Color(
+                ((rgb >> 16) & 0xFF) / 255f,
+                ((rgb >> 8) & 0xFF) / 255f,
+                (rgb & 0xFF) / 255f,
+                Mathf.Clamp01(alpha));
+
+            Vector3 unityPos = FlashToUnityPoint(0f, 0f, worldMatrix);
+            if (!IsFinite(unityPos))
+            {
+                go.SetActive(false);
+                return;
+            }
+
+            go.transform.localPosition = unityPos;
+        }
+
         private TextInstance AcquireInstance(string instanceName)
         {
             TextInstance instance;

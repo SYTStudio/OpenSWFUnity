@@ -722,14 +722,15 @@ namespace OpenSWFUnity.Runtime.AVM2
                 case 0x5D: // findpropstrict
                 case 0x5E: // findproperty
                 {
-                    Avm2QName name = ResolveName(frame, file, instruction.OperandA, null);
+                    Avm2QName name = ResolveLexicalName(frame, file, instruction.OperandA);
                     object holder = FindPropertyHolder(frame, name);
 
                     if (holder == null && opcode == 0x5D)
                     {
                         throw new Avm2ThrownException(MakeError(
                             "ReferenceError",
-                            "Variable " + name + " is not defined"));
+                            "Variable " + name + " is not defined" +
+                            DescribeInstructionLocation(frame, instruction)));
                     }
 
                     frame.Push(holder ?? (object)domain.Global);
@@ -738,7 +739,7 @@ namespace OpenSWFUnity.Runtime.AVM2
 
                 case 0x5F: // finddef
                 {
-                    Avm2QName name = ResolveName(frame, file, instruction.OperandA, null);
+                    Avm2QName name = ResolveLexicalName(frame, file, instruction.OperandA);
                     domain.TryGetGlobal(name, out object definition);
                     frame.Push(definition ?? domain.Global);
                     return ip + 1;
@@ -746,14 +747,15 @@ namespace OpenSWFUnity.Runtime.AVM2
 
                 case 0x60: // getlex
                 {
-                    Avm2QName name = ResolveName(frame, file, instruction.OperandA, null);
+                    Avm2QName name = ResolveLexicalName(frame, file, instruction.OperandA);
                     object holder = FindPropertyHolder(frame, name);
 
                     if (holder == null)
                     {
                         throw new Avm2ThrownException(MakeError(
                             "ReferenceError",
-                            "Variable " + name + " is not defined"));
+                            "Variable " + name + " is not defined" +
+                            DescribeInstructionLocation(frame, instruction)));
                     }
 
                     frame.Push(GetProperty(holder, name));
@@ -775,6 +777,18 @@ namespace OpenSWFUnity.Runtime.AVM2
                     object value = frame.Pop();
                     object runtimeName = RuntimeNameFor(frame, file, instruction.OperandA);
                     object target = frame.Pop();
+
+                    if (Avm2Convert.IsNullOrUndefined(target))
+                    {
+                        Avm2QName missingName =
+                            ResolveName(frame, file, instruction.OperandA, runtimeName);
+                        throw new Avm2ThrownException(MakeError(
+                            "TypeError",
+                            "Cannot set property " + missingName.Local + " on " +
+                            Avm2Convert.ToString(target) +
+                            DescribeInstructionLocation(frame, instruction)));
+                    }
+
                     SetPropertyDynamic(frame, file, instruction.OperandA, target, runtimeName, value);
                     return ip + 1;
                 }
@@ -833,6 +847,18 @@ namespace OpenSWFUnity.Runtime.AVM2
                     object[] args = PopArguments(frame, instruction.OperandB);
                     object runtimeName = RuntimeNameFor(frame, file, instruction.OperandA);
                     object target = frame.Pop();
+
+                    if (Avm2Convert.IsNullOrUndefined(target))
+                    {
+                        Avm2QName missingName =
+                            ResolveName(frame, file, instruction.OperandA, runtimeName);
+                        throw new Avm2ThrownException(MakeError(
+                            "TypeError",
+                            "Cannot call " + missingName.Local + " on " +
+                            Avm2Convert.ToString(target) +
+                            DescribeInstructionLocation(frame, instruction)));
+                    }
+
                     object value = CallPropertyOn(frame, file, instruction.OperandA, target, runtimeName, args);
 
                     if (opcode != 0x4F)
@@ -1036,6 +1062,23 @@ namespace OpenSWFUnity.Runtime.AVM2
             return new Avm2UnsupportedException(opcode, message);
         }
 
+        private static string DescribeInstructionLocation(
+            Avm2ExecutionContext frame,
+            Avm2Instruction instruction
+        )
+        {
+            string method = frame?.Method != null &&
+                            !string.IsNullOrEmpty(frame.Method.Name)
+                ? frame.Method.Name
+                : "<anonymous>";
+            int methodIndex = frame?.Method != null ? frame.Method.Index : -1;
+            string owner = frame?.DeclaringClass != null
+                ? " of " + frame.DeclaringClass.Name
+                : string.Empty;
+            return " in '" + method + "' (method #" + methodIndex + ")" + owner +
+                   " at bytecode offset " + instruction.Offset;
+        }
+
         // ---- helpers: arithmetic and branching --------------------------------
 
         private enum Relation { Less, LessEqual, Greater, GreaterEqual }
@@ -1181,6 +1224,44 @@ namespace OpenSWFUnity.Runtime.AVM2
             return Avm2QName.Public(multiname != null ? multiname.Name : string.Empty);
         }
 
+        // Lexical opcodes carry multinames just like object-property opcodes do.
+        // A Multiname contains an ordered namespace set, so collapsing it to the
+        // empty public namespace makes package classes such as
+        // rumblesushi3D.physics::CollisionPolygon invisible even though the domain
+        // has registered them. Resolve against both the active scopes and all
+        // pending/global definitions before falling back to public.
+        private Avm2QName ResolveLexicalName(
+            Avm2ExecutionContext frame,
+            AbcFile file,
+            int multinameIndex
+        )
+        {
+            if (domain.TryResolveQName(file, multinameIndex, out Avm2QName resolved))
+                return resolved;
+
+            AbcMultiname multiname = file.ConstantPool.GetMultiname(multinameIndex);
+            string local = multiname != null ? multiname.Name : string.Empty;
+            string[] namespaces = domain.GetNamespaceSet(file, multinameIndex);
+
+            for (int n = 0; n < namespaces.Length; n++)
+            {
+                Avm2QName candidate = new Avm2QName(namespaces[n], local);
+
+                for (int i = frame.TotalScopeDepth - 1; i >= 0; i--)
+                {
+                    object scope = frame.GetScopeAt(i);
+
+                    if (scope != null && HasProperty(scope, candidate))
+                        return candidate;
+                }
+
+                if (domain.HasDefinition(candidate))
+                    return candidate;
+            }
+
+            return Avm2QName.Public(local);
+        }
+
         // For a multiname carrying a namespace set, the applicable namespace depends
         // on which one the target actually defines; public is the fallback.
         private Avm2QName ResolveNameForTarget(
@@ -1290,10 +1371,44 @@ namespace OpenSWFUnity.Runtime.AVM2
                 Avm2Class objectClass = obj.Class;
 
                 if (objectClass != null && objectClass.TryFindInstanceBinding(name, out Avm2Binding binding))
-                    return ReadBinding(binding, obj);
+                {
+                    object bound = ReadBinding(binding, obj);
+
+                    // Timeline instance names may also be declared as typed slots.
+                    // Flash fills those slots from PlaceObject before the owner's
+                    // constructor runs; an uninitialised slot therefore gets one
+                    // chance to resolve its named timeline child.
+                    if (Avm2Convert.IsUndefined(bound) &&
+                        obj is Avm2DisplayObject boundDisplay &&
+                        builtins.DisplayHost != null)
+                    {
+                        object timelineChild =
+                            builtins.DisplayHost.ResolveTimelineChild(boundDisplay, name.Local);
+
+                        if (timelineChild != null)
+                        {
+                            WriteBinding(binding, obj, timelineChild);
+                            return timelineChild;
+                        }
+                    }
+
+                    return bound;
+                }
 
                 if (obj.TryGetDynamic(name, out object value))
                     return value;
+
+                if (obj is Avm2DisplayObject display && builtins.DisplayHost != null)
+                {
+                    object timelineChild =
+                        builtins.DisplayHost.ResolveTimelineChild(display, name.Local);
+
+                    if (timelineChild != null)
+                    {
+                        obj.SetDynamic(name, timelineChild);
+                        return timelineChild;
+                    }
+                }
 
                 return Avm2Undefined.Value;
             }
@@ -1627,6 +1742,7 @@ namespace OpenSWFUnity.Runtime.AVM2
                 return cls.NativeConstruct(args);
 
             Avm2Object instance = AllocateInstance(cls);
+            builtins.DisplayHost?.NotifyInstanceConstructed(cls, instance);
 
             if (cls.Constructor != null)
                 Invoke(cls.Constructor, instance, args, cls.CapturedScope ?? Array.Empty<object>(), cls);
@@ -1753,6 +1869,13 @@ namespace OpenSWFUnity.Runtime.AVM2
 
             memberScope[memberScope.Length - 1] = type;
             type.CapturedScope = memberScope;
+
+            // A class name is lexically visible inside its own static initialiser.
+            // The enclosing script does not publish the class into its global slot
+            // until newclass returns, so without this self binding a perfectly
+            // ordinary `CollisionPolygon.someStaticMember` reference throws a
+            // ReferenceError while the class is still being constructed.
+            type.SetDynamic(name, type);
 
             RunStaticInitialiser(type, scope);
             return type;

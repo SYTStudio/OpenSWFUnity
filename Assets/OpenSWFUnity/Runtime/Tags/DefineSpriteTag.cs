@@ -12,6 +12,12 @@ namespace OpenSWFUnity.Runtime.Tags
         // New timeline frames.
         public List<SwfFrame> Frames = new List<SwfFrame>();
 
+        // Streaming audio belongs to the sprite timeline that declares it. Large
+        // games put narration/music inside nested sprites rather than on _root.
+        public SwfSoundStreamHead SoundStreamHead;
+        public List<SwfSoundStreamBlock> SoundStreamBlocks =
+            new List<SwfSoundStreamBlock>();
+
         public override string ToString()
         {
             return

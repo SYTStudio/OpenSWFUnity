@@ -46,6 +46,18 @@ namespace OpenSWFUnity.Runtime
         [Tooltip("Applies the SWF background color to the main camera if available.")]
         public bool applyBackgroundColor = true;
 
+        [Tooltip("Experimental per-fill retained renderer. Keep disabled for large SWFs; the batched GPU renderer uses far fewer GameObjects and draw calls.")]
+        public bool useGpuRetainedRendering = false;
+
+        [Tooltip("Centers the SWF stage and fits it inside the active orthographic camera while preserving aspect ratio.")]
+        public bool autoFitCamera = true;
+
+        [Tooltip("Pillarboxes/letterboxes to the SWF stage aspect so artwork outside the Flash stage cannot leak into the side bars.")]
+        public bool constrainCameraToStageAspect = true;
+
+        [Range(0f, 0.2f)]
+        public float cameraFitPadding = 0.02f;
+
         [Tooltip("Draws SWF fills using a software rasterizer with even-odd fill rule.")]
         private bool enableRasterFills = true;
 
@@ -75,6 +87,9 @@ namespace OpenSWFUnity.Runtime
 
         [Tooltip("Enable detailed Log parsing information to the console. This can be very verbose for complex SWFs.")]
         public bool verboseLogging = false;
+
+        [Tooltip("Writes a small capped trace of play/stop/goto and timeline wraps. Useful for diagnosing scene loops without enabling the very verbose renderer log.")]
+        public bool enableTimelineControlDiagnostics = false;
 
         [Tooltip("Draws debug rectangle bounds around parsed SWF shapes.")]
         public bool enableDebugLines = false;
@@ -124,7 +139,12 @@ namespace OpenSWFUnity.Runtime
         private SwfTextRenderer runtimeTextRenderer;
         private float timelineTimer;
         private int currentTimelineFrame;
+        // A goto/next-frame operation enters its destination immediately. The frame's
+        // actions must run before a playing timeline advances again; otherwise a
+        // gotoAndPlay(2) skips frame 2's stop() and falls through every later scene.
+        private bool rootFrameEnteredPending;
         private long timelineTickSerial;
+        private bool renderStateDirty = true;
         private float swfFrameRate = 30f;
         // Rebuilt every rendered frame. Entries are reused in place and `activeButtonCount`
         // marks how many are live, so a stage full of buttons allocates nothing per frame.
@@ -134,6 +154,7 @@ namespace OpenSWFUnity.Runtime
         private string pressedButtonPath;
         private bool pressedButtonIsOutDown;
         private SwfAudioRuntime runtimeAudio;
+        private float lastFittedCameraAspect = -1f;
         private Avm1Runtime runtimeAvm1;
         private Avm2Runtime runtimeAvm2;
         private ISwfScriptRuntime currentScriptRuntime;
@@ -143,6 +164,11 @@ namespace OpenSWFUnity.Runtime
             new List<DynamicMovieClip>();
         private readonly Dictionary<Avm1Object, DynamicMovieClip> dynamicMovieClipsByObject =
             new Dictionary<Avm1Object, DynamicMovieClip>();
+        private readonly Dictionary<Avm1Object, DynamicBitmapData> dynamicBitmapData =
+            new Dictionary<Avm1Object, DynamicBitmapData>();
+        private readonly Dictionary<Avm1Object, List<AttachedBitmap>> attachedBitmaps =
+            new Dictionary<Avm1Object, List<AttachedBitmap>>();
+        private long nextDynamicMovieClipSerial;
         // Display lists are pure functions of (timeline, frame), so they are built
         // once and reused instead of replaying control tags every rendered frame.
         private readonly Dictionary<List<SwfFrame>, Dictionary<int, List<PlaceObject2Tag>>> displayListCache =
@@ -152,7 +178,16 @@ namespace OpenSWFUnity.Runtime
             new Dictionary<string, StaticDisplayInstance>();
         private readonly Dictionary<Avm1Object, StaticDisplayInstance> staticDisplayInstancesByObject =
             new Dictionary<Avm1Object, StaticDisplayInstance>();
+        private long nextStaticDisplayInstanceSerial;
+        // Verbose render diagnostics must never write once per sprite per frame.
+        // Large games contain thousands of nested sprites; that log flood alone can
+        // stall the Editor and make a healthy timeline look frozen.
+        private readonly HashSet<ushort> verboseLoggedSpriteIds = new HashSet<ushort>();
+        private readonly HashSet<ushort> verboseLoggedUnknownCharacterIds = new HashSet<ushort>();
         private int nextMaskStencilReference = 1;
+        private int timelineControlDiagnosticCount;
+        private const int MaxTimelineControlDiagnostics = 600;
+        private const int TimelineDiagnosticMinFrames = 32;
 
         // Extracting a control tag's action bytes copies them out of the SWF buffer.
         // The timeline re-enters the same frames on every loop, so the copies are
@@ -167,6 +202,8 @@ namespace OpenSWFUnity.Runtime
         private readonly Stack<int> rootTimelineMaskDepths = new Stack<int>();
         private readonly List<int> spriteMaskDepthStack = new List<int>();
         private readonly List<StaticDisplayInstance> enterFrameBuffer =
+            new List<StaticDisplayInstance>();
+        private readonly List<StaticDisplayInstance> staticRemovalBuffer =
             new List<StaticDisplayInstance>();
 
         // Reused snapshot buffer for clip key events, so a held key does not
@@ -221,6 +258,7 @@ namespace OpenSWFUnity.Runtime
         {
             timelineTimer = 0f;
             currentTimelineFrame = 0;
+            rootFrameEnteredPending = false;
             timelineTickSerial++;
             runtimeAudio?.StopAll();
             debugFrame = 0;
@@ -244,6 +282,16 @@ namespace OpenSWFUnity.Runtime
                 return;
 
             SyncQualityIfChanged();
+
+            float displayAspect = Screen.height > 0
+                ? (float)Screen.width / Screen.height
+                : (Camera.main != null ? Camera.main.aspect : 1f);
+
+            if (autoFitCamera && Camera.main != null &&
+                !Mathf.Approximately(lastFittedCameraAspect, displayAspect))
+            {
+                FitCameraToStage();
+            }
 
             if (inputEnabled)
             {
@@ -270,13 +318,31 @@ namespace OpenSWFUnity.Runtime
                     steps++;
                     timelineTickSerial++;
 
-                    if (autoPlayTimeline)
+                    if (rootFrameEnteredPending)
+                    {
+                        // Execute the frame selected by goto/nextFrame on this step.
+                        // It may contain stop(), another goto, sound control, or setup
+                        // that must happen before the playhead is allowed to move on.
+                        rootFrameEnteredPending = false;
+                    }
+                    else if (autoPlayTimeline)
+                    {
                         currentTimelineFrame++;
+                        renderStateDirty = true;
+                    }
 
                     AdvanceStaticMovieClips();
                     AdvanceDynamicMovieClips();
                     ExecuteCurrentTimelineActions();
                     AdvanceAvm2Frame();
+
+                    // AS3 can mutate display properties and BitmapData directly
+                    // during enterFrame. Those writes do not pass through the
+                    // static timeline's dirty flags, so an AVM2 movie must present
+                    // once after each script tick even when its root playhead is
+                    // stopped (software-rendered games rely on exactly this).
+                    if (runtimeAvm2 != null)
+                        renderStateDirty = true;
                 }
 
                 if (steps >= MaxTimelineCatchUpSteps)
@@ -287,7 +353,7 @@ namespace OpenSWFUnity.Runtime
                     timelineTimer = 0f;
                 }
 
-                if (steps > 0)
+                if (steps > 0 && renderStateDirty)
                     RenderCurrentFrame();
 
                 // Streaming audio is positioned from the playhead rather than left to
@@ -299,6 +365,9 @@ namespace OpenSWFUnity.Runtime
 
         private void Start()
         {
+            SwfRenderDiagnostics.Reset();
+            SwfRenderDiagnostics.Enabled = verboseLogging;
+
             if (swfFile == null)
             {
                 Debug.LogError("No SWF file assigned.");
@@ -332,10 +401,25 @@ namespace OpenSWFUnity.Runtime
                     header.StageHeight
                 );
 
+                // One MeshRenderer per fill is useful for small animations but is a
+                // catastrophic object/draw-call explosion for games such as Isaac.
+                // Keep the Inspector switch as an experimental small-movie option,
+                // with a hard guard so a saved checkbox cannot crash a build.
+                bool retainedRenderingAllowed =
+                    useGpuRetainedRendering && parser.Shapes.Count <= 1024;
+                runtimeRasterRenderer.UseRetainedGpuRendering = retainedRenderingAllowed;
+
                 // Lets bitmap fills resolve their character id to a decoded
                 // texture; textures are built on first use, not at parse time.
                 runtimeRasterRenderer.BitmapProvider = bitmapId =>
                     parser.FindBitmapById(bitmapId)?.GetTexture();
+                runtimeRasterRenderer.BitmapSizeProvider = bitmapId =>
+                {
+                    DefineBitmapTag bitmap = parser.FindBitmapById(bitmapId);
+                    return bitmap != null
+                        ? new Vector2Int(bitmap.Width, bitmap.Height)
+                        : Vector2Int.zero;
+                };
                 runtimeTextRenderer = new SwfTextRenderer(
                     transform,
                     header.StageWidth,
@@ -372,6 +456,8 @@ namespace OpenSWFUnity.Runtime
                 {
                     Camera.main.backgroundColor = parser.BackgroundColor.ToUnityColor();
                 }
+
+                FitCameraToStage();
 
                 if (verboseLogging)
                 {
@@ -493,6 +579,7 @@ namespace OpenSWFUnity.Runtime
             {
                 runtimeRasterRenderer?.EndFrame();
                 runtimeTextRenderer?.EndFrame();
+                renderStateDirty = false;
             }
         }
 
@@ -510,6 +597,65 @@ namespace OpenSWFUnity.Runtime
             }
 
             return count;
+        }
+
+        private void FitCameraToStage()
+        {
+            if (!autoFitCamera || runtimeParser?.Header == null)
+                return;
+
+            Camera camera = Camera.main;
+
+            if (camera == null || !camera.orthographic)
+                return;
+
+            const float pixelsPerUnit = 50f;
+            float displayAspect = Screen.height > 0
+                ? Mathf.Max(0.01f, (float)Screen.width / Screen.height)
+                : Mathf.Max(0.01f, camera.aspect);
+            float stageAspect = Mathf.Max(
+                0.01f,
+                runtimeParser.Header.StageWidth / runtimeParser.Header.StageHeight);
+
+            if (constrainCameraToStageAspect)
+            {
+                Rect viewport = new Rect(0f, 0f, 1f, 1f);
+
+                if (displayAspect > stageAspect)
+                {
+                    viewport.width = stageAspect / displayAspect;
+                    viewport.x = (1f - viewport.width) * 0.5f;
+                }
+                else if (displayAspect < stageAspect)
+                {
+                    viewport.height = displayAspect / stageAspect;
+                    viewport.y = (1f - viewport.height) * 0.5f;
+                }
+
+                camera.rect = viewport;
+            }
+            else
+            {
+                camera.rect = new Rect(0f, 0f, 1f, 1f);
+            }
+
+            float aspect = constrainCameraToStageAspect
+                ? stageAspect
+                : displayAspect;
+            float scaleX = Mathf.Abs(transform.lossyScale.x);
+            float scaleY = Mathf.Abs(transform.lossyScale.y);
+            float halfHeight = runtimeParser.Header.StageHeight * scaleY /
+                (pixelsPerUnit * 2f);
+            float halfWidthForAspect = runtimeParser.Header.StageWidth * scaleX /
+                (pixelsPerUnit * 2f * aspect);
+            camera.orthographicSize = Mathf.Max(halfHeight, halfWidthForAspect) *
+                (1f + Mathf.Max(0f, cameraFitPadding));
+
+            Vector3 cameraPosition = camera.transform.position;
+            cameraPosition.x = transform.position.x;
+            cameraPosition.y = transform.position.y;
+            camera.transform.position = cameraPosition;
+            lastFittedCameraAspect = displayAspect;
         }
 
         private void ClearDebugLines()
@@ -559,6 +705,18 @@ namespace OpenSWFUnity.Runtime
 
             debugFrame = rootFrame;
             rootTimelineMaskDepths.Clear();
+            SwfMatrix rootMatrix = runtimeAvm1 != null
+                ? BuildDynamicMovieClipMatrix(runtimeAvm1.RootObject)
+                : SwfMatrix.Identity;
+            float rootAlpha = runtimeAvm1 != null
+                ? Mathf.Clamp01(Avm1Float(runtimeAvm1.RootObject.Get("_alpha"), 100f) / 100f)
+                : 1f;
+
+            if (runtimeAvm1 != null &&
+                !Avm1Boolean(runtimeAvm1.RootObject.Get("_visible"), true))
+            {
+                return;
+            }
 
             foreach (PlaceObject2Tag placed in places)
             {
@@ -571,7 +729,7 @@ namespace OpenSWFUnity.Runtime
                 if (!placed.HasCharacter || placed.CharacterId == 0)
                     continue;
 
-                float alpha = 1f;
+                float alpha = rootAlpha;
 
                 if (placed.HasColorTransform && placed.ColorTransform != null)
                 {
@@ -584,7 +742,8 @@ namespace OpenSWFUnity.Runtime
                 bool isSprite = parser.FindSpriteById(placed.CharacterId) != null;
                 string timelinePath = "_root/depth" + placed.Depth +
                     (isSprite ? ":sprite" : ":char") + placed.CharacterId;
-                StaticDisplayInstance instance = runtimeAvm1 != null
+                StaticDisplayInstance instance = runtimeAvm1 != null &&
+                    RequiresScriptInstance(parser, placed.CharacterId)
                     ? GetOrCreateStaticDisplayInstance(
                         timelinePath,
                         placed,
@@ -601,6 +760,7 @@ namespace OpenSWFUnity.Runtime
                 SwfMatrix effectiveMatrix = instance != null
                     ? BuildDynamicMovieClipMatrix(instance.ScriptObject)
                     : placed.Matrix;
+                effectiveMatrix = SwfMatrix.Combine(rootMatrix, effectiveMatrix);
 
                 // Timeline-placed clips honour _visible exactly like dynamically
                 // created ones. Content routinely parks a pile of clips on frame 1
@@ -663,7 +823,7 @@ namespace OpenSWFUnity.Runtime
                 rootTimelineMaskDepths.Pop();
             }
 
-            RenderDynamicMovieClips(parser, renderer, null, SwfMatrix.Identity, 1f, 0);
+            RenderDynamicMovieClips(parser, renderer, null, rootMatrix, rootAlpha, 0);
             RenderAvm2DisplayTree(parser, renderer);
         }
 
@@ -779,9 +939,9 @@ namespace OpenSWFUnity.Runtime
 
             if (sprite != null)
             {
-                if (verboseLogging)
+                if (verboseLogging && verboseLoggedSpriteIds.Add(sprite.SpriteId))
                 {
-                    Debug.Log("Entering Sprite " + sprite.SpriteId + " at " + path);
+                    Debug.Log("First render of Sprite " + sprite.SpriteId + " at " + path);
                 }
 
                 RenderSpriteDebug(
@@ -827,6 +987,25 @@ namespace OpenSWFUnity.Runtime
                 return;
             }
 
+            DefineEditTextTag editText = parser.FindEditTextById(characterId);
+
+            if (editText != null)
+            {
+                if (enableTextMeshDebug)
+                {
+                    runtimeTextRenderer?.DrawEditText(
+                        editText,
+                        ResolveEditTextValue(editText, scriptObject),
+                        worldMatrix,
+                        "EditText_" + characterId + "_" + path,
+                        textMeshCharacterSize,
+                        alpha
+                    );
+                }
+
+                return;
+            }
+
             DefineButton2Tag button = parser.FindButton2ById(characterId);
 
             if (button != null)
@@ -855,7 +1034,7 @@ namespace OpenSWFUnity.Runtime
                 return;
             }
 
-            if (verboseLogging)
+            if (verboseLogging && verboseLoggedUnknownCharacterIds.Add(characterId))
             {
                 Debug.LogWarning("Unknown CharacterId: " + characterId + " at " + path);
             }
@@ -1029,7 +1208,8 @@ namespace OpenSWFUnity.Runtime
                 string childTimelinePath = (timelinePath ?? path) + "/depth" +
                     innerPlace.Depth + (childIsSprite ? ":sprite" : ":char") +
                     innerPlace.CharacterId;
-                StaticDisplayInstance childInstance = runtimeAvm1 != null
+                StaticDisplayInstance childInstance = runtimeAvm1 != null &&
+                    RequiresScriptInstance(parser, innerPlace.CharacterId)
                     ? GetOrCreateStaticDisplayInstance(
                         childTimelinePath,
                         innerPlace,
@@ -1483,11 +1663,16 @@ namespace OpenSWFUnity.Runtime
             runtimeAvm1.RootObject.Set("_ymouse", stagePoint.y);
             Dictionary<Avm1Object, SwfMatrix> worldMatrices =
                 new Dictionary<Avm1Object, SwfMatrix>();
-            worldMatrices[runtimeAvm1.RootObject] = SwfMatrix.Identity;
+            SwfMatrix rootWorld = BuildDynamicMovieClipMatrix(runtimeAvm1.RootObject);
+            worldMatrices[runtimeAvm1.RootObject] = rootWorld;
+            SetLocalMousePosition(runtimeAvm1.RootObject, rootWorld, stagePoint);
 
             foreach (StaticDisplayInstance instance in staticDisplayInstances.Values)
             {
                 if (instance?.ScriptObject == null)
+                    continue;
+
+                if (instance.LastSeenTimelineTick < timelineTickSerial - 1)
                     continue;
 
                 if (TryGetDisplayObjectWorldMatrix(instance.ScriptObject, worldMatrices, 0, out SwfMatrix world))
@@ -1530,7 +1715,10 @@ namespace OpenSWFUnity.Runtime
             else
                 parent = scriptObject.Get("_parent") as Avm1Object;
 
-            SwfMatrix parentWorld = SwfMatrix.Identity;
+            SwfMatrix parentWorld = parent == runtimeAvm1.RootObject &&
+                cache.TryGetValue(runtimeAvm1.RootObject, out SwfMatrix cachedRoot)
+                    ? cachedRoot
+                    : SwfMatrix.Identity;
 
             if (parent != null && parent != runtimeAvm1.RootObject &&
                 !TryGetDisplayObjectWorldMatrix(parent, cache, depth + 1, out parentWorld))
@@ -1615,6 +1803,12 @@ namespace OpenSWFUnity.Runtime
                     continue;
 
                 ButtonActionTriggered?.Invoke(button, action);
+
+                ReportTimelineControl(
+                    "button id=" + button.ButtonId +
+                    " transition=0x" + transitionFlag.ToString("X4") +
+                    " path=" + instance.Path
+                );
 
                 if (runtimeAvm1 != null)
                     runtimeAvm1.Execute(
@@ -1748,12 +1942,24 @@ namespace OpenSWFUnity.Runtime
 
         private void InitializeScriptRuntime(SwfParser parser)
         {
+            foreach (DynamicBitmapData bitmap in dynamicBitmapData.Values)
+            {
+                if (bitmap?.Texture != null)
+                    Destroy(bitmap.Texture);
+            }
+
+            dynamicBitmapData.Clear();
+            attachedBitmaps.Clear();
             runtimeAvm1 = null;
             runtimeAvm2 = null;
             currentScriptRuntime = null;
+            rootFrameEnteredPending = false;
+            timelineControlDiagnosticCount = 0;
             avm1LastExecutedFrames.Clear();
             dynamicMovieClips.Clear();
             dynamicMovieClipsByObject.Clear();
+            nextDynamicMovieClipSerial = 0;
+            nextStaticDisplayInstanceSerial = 0;
             staticDisplayInstances.Clear();
             staticDisplayInstancesByObject.Clear();
             displayListCache.Clear();
@@ -1860,6 +2066,7 @@ namespace OpenSWFUnity.Runtime
                 ExternalMethod = HandleAvm1ExternalMethod,
                 ComputedPropertyGetter = GetDisplayObjectComputedProperty,
                 ComputedPropertySetter = SetDisplayObjectComputedProperty,
+                MemberChanged = HandleAvm1MemberChanged,
                 Trace = message => Debug.Log("[AVM1] " + message)
             };
 
@@ -1914,6 +2121,21 @@ namespace OpenSWFUnity.Runtime
             runtimeAvm1.RootObject.Set("_width", parser.Header.StageWidth);
             runtimeAvm1.RootObject.Set("_height", parser.Header.StageHeight);
             runtimeAvm1.RootObject.Set("_totalframes", parser.Header.FrameCount);
+            // The complete local asset is resident before frame 1 executes. Classic
+            // AS1/AS2 preloaders commonly stop on their splash frame until
+            // _framesloaded == _totalframes (or getBytesLoaded == getBytesTotal).
+            // Leaving these properties undefined made every such movie wait forever.
+            runtimeAvm1.RootObject.Set("_framesloaded", parser.Header.FrameCount);
+            double loadedByteCount = swfFile?.bytes != null ? swfFile.bytes.LongLength : 0d;
+            runtimeAvm1.RootObject.Set("_bytesloaded", loadedByteCount);
+            runtimeAvm1.RootObject.Set("_bytestotal", loadedByteCount);
+            runtimeAvm1.RootObject.Set("_x", 0d);
+            runtimeAvm1.RootObject.Set("_y", 0d);
+            runtimeAvm1.RootObject.Set("_xscale", 100d);
+            runtimeAvm1.RootObject.Set("_yscale", 100d);
+            runtimeAvm1.RootObject.Set("_rotation", 0d);
+            runtimeAvm1.RootObject.Set("_alpha", 100d);
+            runtimeAvm1.RootObject.Set("_visible", true);
 
             if (runtimeAvm1.GetVariable("Stage") is Avm1Object stageObject)
             {
@@ -1962,6 +2184,7 @@ namespace OpenSWFUnity.Runtime
                 return;
 
             using var _profilerScope = timelineActionsMarker.Auto();
+            runtimeAudio?.BeginSpriteStreamFrame();
 
             if (runtimeParser.RootFrames != null && runtimeParser.RootFrames.Count > 0)
             {
@@ -1987,6 +2210,10 @@ namespace OpenSWFUnity.Runtime
                         continue;
 
                     bool isSprite = runtimeParser.FindSpriteById(place.CharacterId) != null;
+
+                    if (!RequiresScriptInstance(runtimeParser, place.CharacterId))
+                        continue;
+
                     string path = "_root/depth" + place.Depth +
                         (isSprite ? ":sprite" : ":char") + place.CharacterId;
                     GetOrCreateStaticDisplayInstance(path, place, runtimeAvm1.RootObject);
@@ -2008,6 +2235,13 @@ namespace OpenSWFUnity.Runtime
                 );
             }
 
+            // attachMovie/createEmptyMovieClip instances are separate timeline roots.
+            // Visit them before enterFrame dispatch so every live static descendant is
+            // marked for this exact display-list tick. That gives the cleanup below a
+            // reliable distinction between a stopped clip and a clip which no longer
+            // exists on stage.
+            ExecuteDynamicMovieClipSubtreeActions();
+
             runtimeAvm1.TryCallFunction("onEnterFrame", NoArgs, out _);
 
             // Dispatched from a snapshot: the handlers below run arbitrary script, and
@@ -2024,6 +2258,14 @@ namespace OpenSWFUnity.Runtime
             for (int i = 0; i < enterFrameBuffer.Count; i++)
             {
                 StaticDisplayInstance instance = enterFrameBuffer[i];
+
+                if (instance == null ||
+                    instance.LastSeenTimelineTick != timelineTickSerial ||
+                    runtimeParser.FindSpriteById(instance.CharacterId) == null)
+                {
+                    continue;
+                }
+
                 TriggerClipActions(instance, 0x00000040u);
                 runtimeAvm1.TryCallMethod(instance.ScriptObject, "onEnterFrame", NoArgs, out _);
             }
@@ -2036,9 +2278,192 @@ namespace OpenSWFUnity.Runtime
             {
                 DynamicMovieClip clip = dynamicMovieClips[i];
 
-                if (!clip.Removed)
+                if (!clip.Removed &&
+                    IsDisplayParentActive(clip.ParentObject, timelineTickSerial, 0))
+                {
                     runtimeAvm1.TryCallMethod(clip.ScriptObject, "onEnterFrame", NoArgs, out _);
+                }
             }
+
+            // enterFrame handlers can seek timelines or attach/remove clips. Traverse
+            // once more so the display list being rendered this tick has already run
+            // its entry actions, then unload everything no longer reachable.
+            ExecuteDynamicMovieClipSubtreeActions();
+            RemoveInactiveDisplayObjects();
+
+            runtimeAudio?.EndSpriteStreamFrame();
+        }
+
+        private void ExecuteDynamicMovieClipSubtreeActions()
+        {
+            int dynamicCount = dynamicMovieClips.Count;
+
+            for (int i = 0; i < dynamicCount; i++)
+            {
+                DynamicMovieClip clip = dynamicMovieClips[i];
+
+                if (clip == null || clip.Removed || clip.CharacterId == 0 ||
+                    !IsDisplayParentActive(clip.ParentObject, timelineTickSerial, 0))
+                {
+                    continue;
+                }
+
+                DefineSpriteTag sprite = runtimeParser.FindSpriteById(clip.CharacterId);
+
+                if (sprite == null || sprite.Frames == null || sprite.Frames.Count == 0)
+                    continue;
+
+                int localFrame = Mathf.Clamp(clip.CurrentFrame, 0, sprite.Frames.Count - 1);
+                runtimeAudio?.SyncSpriteStream(sprite, localFrame, clip.IsPlaying);
+                List<PlaceObject2Tag> places = BuildDisplayListForFrame(
+                    runtimeParser,
+                    sprite.Frames,
+                    localFrame
+                );
+
+                ExecuteVisibleSpriteActions(
+                    places,
+                    localFrame,
+                    "_dynamic/" + clip.Serial,
+                    clip.ScriptObject,
+                    0
+                );
+            }
+        }
+
+        private void RemoveInactiveDisplayObjects()
+        {
+            // A dynamic clip attached below a timeline instance belongs to that
+            // instance's display-list lifetime. It must not keep receiving
+            // onEnterFrame or playing sounds after its parent disappears.
+            for (int i = dynamicMovieClips.Count - 1; i >= 0; i--)
+            {
+                DynamicMovieClip clip = dynamicMovieClips[i];
+
+                if (clip == null || clip.Removed ||
+                    IsDisplayParentActive(clip.ParentObject, timelineTickSerial, 0))
+                {
+                    continue;
+                }
+
+                RemoveDynamicMovieClip(clip.ScriptObject);
+            }
+
+            staticRemovalBuffer.Clear();
+
+            foreach (StaticDisplayInstance instance in staticDisplayInstances.Values)
+            {
+                if (instance != null &&
+                    instance.LastSeenTimelineTick != timelineTickSerial)
+                {
+                    staticRemovalBuffer.Add(instance);
+                }
+            }
+
+            // Children unload before their parents, matching the display-list tree
+            // and ensuring their onUnload handlers can still inspect the parent.
+            staticRemovalBuffer.Sort((left, right) =>
+                (right.Path?.Length ?? 0).CompareTo(left.Path?.Length ?? 0));
+
+            for (int i = 0; i < staticRemovalBuffer.Count; i++)
+                RemoveStaticDisplayInstance(staticRemovalBuffer[i]);
+
+            staticRemovalBuffer.Clear();
+        }
+
+        private bool IsDisplayParentActive(
+            Avm1Object parentObject,
+            long requiredTimelineTick,
+            int recursionDepth
+        )
+        {
+            if (parentObject == null || parentObject == runtimeAvm1?.RootObject)
+                return true;
+
+            if (recursionDepth > 128)
+                return false;
+
+            if (staticDisplayInstancesByObject.TryGetValue(
+                parentObject,
+                out StaticDisplayInstance staticParent
+            ))
+            {
+                return staticParent.LastSeenTimelineTick == requiredTimelineTick &&
+                    IsDisplayParentActive(
+                        staticParent.ParentObject,
+                        requiredTimelineTick,
+                        recursionDepth + 1
+                    );
+            }
+
+            if (dynamicMovieClipsByObject.TryGetValue(
+                parentObject,
+                out DynamicMovieClip dynamicParent
+            ))
+            {
+                return !dynamicParent.Removed &&
+                    IsDisplayParentActive(
+                        dynamicParent.ParentObject,
+                        requiredTimelineTick,
+                        recursionDepth + 1
+                    );
+            }
+
+            return false;
+        }
+
+        private void RemoveStaticDisplayInstance(StaticDisplayInstance instance)
+        {
+            if (instance?.ScriptObject == null)
+                return;
+
+            Avm1Object scriptObject = instance.ScriptObject;
+
+            // Remove attached dynamic descendants first. RemoveDynamicMovieClip
+            // recursively handles deeper dynamic children and their onUnload calls.
+            for (int i = dynamicMovieClips.Count - 1; i >= 0; i--)
+            {
+                DynamicMovieClip child = dynamicMovieClips[i];
+
+                if (child != null && !child.Removed &&
+                    child.ParentObject == scriptObject)
+                {
+                    RemoveDynamicMovieClip(child.ScriptObject);
+                }
+            }
+
+            TriggerClipActions(instance, 0x00000020u); // Unload
+            runtimeAvm1?.TryCallMethod(scriptObject, "onUnload", NoArgs, out _);
+
+            if (!string.IsNullOrEmpty(instance.InstanceName) &&
+                instance.ParentObject != null &&
+                instance.ParentObject.TryGetOwn(
+                    instance.InstanceName,
+                    out object currentBinding
+                ) &&
+                ReferenceEquals(currentBinding, scriptObject))
+            {
+                instance.ParentObject.Remove(instance.InstanceName);
+            }
+
+            foreach (StaticDisplayInstance owner in staticDisplayInstances.Values)
+            {
+                if (owner != null && owner.MaskObject == scriptObject)
+                    owner.MaskObject = null;
+            }
+
+            for (int i = 0; i < dynamicMovieClips.Count; i++)
+            {
+                DynamicMovieClip owner = dynamicMovieClips[i];
+
+                if (owner != null && owner.MaskObject == scriptObject)
+                    owner.MaskObject = null;
+            }
+
+            attachedBitmaps.Remove(scriptObject);
+            avm1LastExecutedFrames.Remove("_static/" + instance.Serial);
+            staticDisplayInstancesByObject.Remove(scriptObject);
+            staticDisplayInstances.Remove(instance.Path);
         }
 
         private void ExecuteVisibleSpriteActions(
@@ -2072,6 +2497,7 @@ namespace OpenSWFUnity.Runtime
                 );
                 int localFrame = Mathf.Clamp(instance.CurrentFrame, 0, sprite.Frames.Count - 1);
                 instance.ScriptObject.Set("_currentframe", localFrame + 1);
+                runtimeAudio?.SyncSpriteStream(sprite, localFrame, instance.IsPlaying);
                 SwfFrame frame = sprite.Frames[localFrame];
                 List<PlaceObject2Tag> childPlaces = BuildDisplayListForFrame(
                     runtimeParser,
@@ -2087,12 +2513,48 @@ namespace OpenSWFUnity.Runtime
                         continue;
 
                     bool childIsSprite = runtimeParser.FindSpriteById(child.CharacterId) != null;
+
+                    if (!RequiresScriptInstance(runtimeParser, child.CharacterId))
+                        continue;
+
                     string childPath = path + "/depth" + child.Depth +
                         (childIsSprite ? ":sprite" : ":char") + child.CharacterId;
                     GetOrCreateStaticDisplayInstance(childPath, child, instance.ScriptObject);
                 }
 
-                ExecuteFrameActionsOnce(path, localFrame, frame.ControlTags, instance.ScriptObject);
+                bool firstActionPass = !instance.HasExecutedFrameActions;
+                int frameBeforeActions = instance.CurrentFrame;
+                bool playingBeforeActions = instance.IsPlaying;
+
+                ExecuteFrameActionsOnce(
+                    "_static/" + instance.Serial,
+                    localFrame,
+                    frame.ControlTags,
+                    instance.ScriptObject
+                );
+
+                if (firstActionPass && sprite.Frames.Count >= TimelineDiagnosticMinFrames)
+                {
+                    ReportTimelineControl(
+                        "static enter char=" + instance.CharacterId +
+                        " serial=" + instance.Serial +
+                        " sourceFrame=" + (localFrame + 1) +
+                        " resultFrame=" + (instance.CurrentFrame + 1) +
+                        " playing=" + instance.IsPlaying +
+                        " changed=" +
+                        (frameBeforeActions != instance.CurrentFrame ||
+                         playingBeforeActions != instance.IsPlaying) +
+                        " name=" + instance.InstanceName +
+                        " path=" + instance.Path
+                    );
+                }
+                // Rendering may discover a newly placed MovieClip between Flash
+                // ticks (for example immediately after a button changes scene).
+                // Its frame-1 actions must run before AdvanceStaticMovieClips is
+                // allowed to move it to frame 2. Otherwise stop(), class setup and
+                // input/onEnterFrame registration are skipped and the symbol turns
+                // into a slideshow of all of its library frames.
+                instance.HasExecutedFrameActions = true;
 
                 ExecuteVisibleSpriteActions(
                     childPlaces,
@@ -2214,8 +2676,23 @@ namespace OpenSWFUnity.Runtime
         {
             if (staticDisplayInstances.TryGetValue(path, out StaticDisplayInstance existing))
             {
+                Avm1Object resolvedParent = parentObject ?? runtimeAvm1.RootObject;
+                string resolvedName = place.HasName && !string.IsNullOrEmpty(place.Name)
+                    ? place.Name
+                    : string.Empty;
                 existing.ClipActions = place.ClipActions;
-                bool reenteredTimeline = existing.LastSeenTimelineTick < timelineTickSerial - 1;
+                bool placementChanged =
+                    existing.TimelineStartFrame != place.TimelineStartFrame;
+                bool reenteredTimeline =
+                    existing.LastSeenTimelineTick < timelineTickSerial - 1 ||
+                    placementChanged;
+                bool bindingChanged =
+                    existing.ParentObject != resolvedParent ||
+                    !string.Equals(
+                        existing.InstanceName,
+                        resolvedName,
+                        System.StringComparison.Ordinal
+                    );
                 existing.LastSeenTimelineTick = timelineTickSerial;
 
                 // Move/update PlaceObject tags carry the authoritative matrix for
@@ -2238,9 +2715,56 @@ namespace OpenSWFUnity.Runtime
                     // the state that must not leak from its previous appearance.
                     existing.CurrentFrame = 0;
                     existing.IsPlaying = true;
+                    existing.FrameEnteredPending = false;
+                    existing.HasExecutedFrameActions = false;
+                    existing.Serial = ++nextStaticDisplayInstanceSerial;
                     existing.MaskObject = null;
                     existing.ScriptObject.Set("_alpha", 100d);
                     existing.ScriptObject.Set("_currentframe", 1);
+                }
+
+                if (reenteredTimeline || bindingChanged)
+                {
+                    // A timeline instance name is also a property on its parent
+                    // MovieClip. Static instances are allocation-cached by path, so
+                    // a remove/re-place used to revive the rendered object without
+                    // restoring that property. ActionScript could then see the clip
+                    // on stage while `parent.childName` evaluated to undefined, and
+                    // gotoAndStop/stop targeted at it were silently lost.
+                    //
+                    // Remove only our own old binding: a script is allowed to have
+                    // replaced that member while the old timeline lifetime was gone.
+                    if (!string.IsNullOrEmpty(existing.InstanceName) &&
+                        existing.ParentObject != null &&
+                        existing.ParentObject.TryGetOwn(
+                            existing.InstanceName,
+                            out object oldBinding
+                        ) &&
+                        ReferenceEquals(oldBinding, existing.ScriptObject))
+                    {
+                        existing.ParentObject.Remove(existing.InstanceName);
+                    }
+
+                    existing.ParentObject = resolvedParent;
+                    existing.InstanceName = resolvedName;
+                    existing.TimelineStartFrame = place.TimelineStartFrame;
+                    existing.ScriptObject.Set("_parent", resolvedParent);
+                    existing.ScriptObject.Set("_name", resolvedName);
+                    existing.ScriptObject.Set("_target", path);
+                    existing.ScriptObject.Set("_depth", place.Depth);
+                }
+
+                // Keep the display-list name authoritative while the object is
+                // placed. This also repairs a missing binding when the instance was
+                // first discovered through a render traversal between script ticks.
+                if (!string.IsNullOrEmpty(existing.InstanceName) &&
+                    (!existing.ParentObject.TryGetOwn(
+                        existing.InstanceName,
+                        out object currentBinding
+                    ) ||
+                    !ReferenceEquals(currentBinding, existing.ScriptObject)))
+                {
+                    existing.ParentObject.Set(existing.InstanceName, existing.ScriptObject);
                 }
 
                 if (reenteredTimeline || existing.TimelineVisible != timelineVisible)
@@ -2266,9 +2790,12 @@ namespace OpenSWFUnity.Runtime
                 Depth = place.Depth,
                 CurrentFrame = 0,
                 IsPlaying = true,
+                HasExecutedFrameActions = false,
                 TimelineMatrix = place.Matrix,
                 TimelineVisible = !place.HasVisible || place.Visible != 0,
+                TimelineStartFrame = place.TimelineStartFrame,
                 LastSeenTimelineTick = timelineTickSerial,
+                Serial = ++nextStaticDisplayInstanceSerial,
                 ClipActions = place.ClipActions
             };
 
@@ -2344,8 +2871,62 @@ namespace OpenSWFUnity.Runtime
             scriptObject.Set("_alpha", 100d);
             scriptObject.Set("_visible", visible);
             scriptObject.Set("_currentframe", 1);
-            scriptObject.Set("_totalframes", GetCharacterFrameCount(characterId));
+            int totalFrames = GetCharacterFrameCount(characterId);
+            scriptObject.Set("_totalframes", totalFrames);
+            scriptObject.Set("_framesloaded", totalFrames);
             scriptObject.Set("__characterId", characterId);
+            InitializeEditTextProperties(scriptObject, parentObject, characterId);
+        }
+
+        private void InitializeEditTextProperties(
+            Avm1Object scriptObject,
+            Avm1Object parentObject,
+            ushort characterId
+        )
+        {
+            DefineEditTextTag editText = runtimeParser?.FindEditTextById(characterId);
+
+            if (editText == null || scriptObject == null)
+                return;
+
+            scriptObject.Set("text", editText.InitialText ?? string.Empty);
+            string variable = editText.VariableName ?? string.Empty;
+
+            if (parentObject != null && !string.IsNullOrEmpty(variable) &&
+                variable.IndexOf('.') < 0 && variable.IndexOf(':') < 0 &&
+                !parentObject.TryGet(variable, out _))
+            {
+                parentObject.Set(variable, editText.InitialText ?? string.Empty);
+            }
+        }
+
+        private string ResolveEditTextValue(
+            DefineEditTextTag editText,
+            Avm1Object scriptObject
+        )
+        {
+            if (editText == null)
+                return string.Empty;
+
+            string variable = editText.VariableName ?? string.Empty;
+            Avm1Object parentObject = scriptObject?.Get("_parent") as Avm1Object;
+
+            if (!string.IsNullOrEmpty(variable))
+            {
+                if (parentObject != null && parentObject.TryGet(variable, out object parentValue) &&
+                    parentValue != null)
+                {
+                    return parentValue.ToString();
+                }
+
+                object globalValue = runtimeAvm1?.GetVariable(variable);
+
+                if (globalValue != null)
+                    return globalValue.ToString();
+            }
+
+            object directValue = scriptObject?.Get("text");
+            return directValue?.ToString() ?? editText.InitialText ?? string.Empty;
         }
 
         private static void ApplyTimelineTransform(Avm1Object scriptObject, SwfMatrix matrix)
@@ -2429,7 +3010,8 @@ namespace OpenSWFUnity.Runtime
                 InstanceName = instanceName,
                 Depth = depth,
                 CurrentFrame = 0,
-                IsPlaying = true
+                IsPlaying = true,
+                Serial = ++nextDynamicMovieClipSerial
             };
 
             scriptObject.Set("_root", runtimeAvm1.RootObject);
@@ -2444,14 +3026,18 @@ namespace OpenSWFUnity.Runtime
             scriptObject.Set("_alpha", 100d);
             scriptObject.Set("_visible", true);
             scriptObject.Set("_currentframe", 1);
-            scriptObject.Set("_totalframes", GetCharacterFrameCount(characterId));
+            int totalFrames = GetCharacterFrameCount(characterId);
+            scriptObject.Set("_totalframes", totalFrames);
+            scriptObject.Set("_framesloaded", totalFrames);
             scriptObject.Set("__linkage", linkageName ?? string.Empty);
             scriptObject.Set("__characterId", characterId);
+            InitializeEditTextProperties(scriptObject, parentObject, characterId);
 
             initObject?.CopyMembersTo(scriptObject);
 
             dynamicMovieClips.Add(clip);
             dynamicMovieClipsByObject[scriptObject] = clip;
+            renderStateDirty = true;
 
             if (!string.IsNullOrEmpty(instanceName))
                 parentObject.Set(instanceName, scriptObject);
@@ -2459,6 +3045,16 @@ namespace OpenSWFUnity.Runtime
             runtimeAvm1.ApplyRegisteredClass(linkageName, scriptObject);
 
             ExecuteInitActionsForCharacter(characterId, scriptObject);
+            if (ShouldReportTimelineClip(characterId))
+            {
+                ReportTimelineControl(
+                    "dynamic create char=" + characterId +
+                    " serial=" + clip.Serial +
+                    " frames=" + totalFrames +
+                    " name=" + (instanceName ?? string.Empty) +
+                    " linkage=" + (linkageName ?? string.Empty)
+                );
+            }
             ExecuteDynamicClipFrameActions(clip);
             return scriptObject;
         }
@@ -2487,6 +3083,7 @@ namespace OpenSWFUnity.Runtime
             // still read the clip's own properties. Marking Removed first would also
             // make a handler that re-entered removeMovieClip recurse.
             clip.Removed = true;
+            renderStateDirty = true;
 
             // Detach the mask from every owner before the object disappears. Flash
             // does not keep clipping with a MovieClip that is no longer on stage.
@@ -2535,7 +3132,15 @@ namespace OpenSWFUnity.Runtime
                     continue;
 
                 clip.CurrentFrame = (clip.CurrentFrame + 1) % frameCount;
+
+                if (clip.CurrentFrame == 0 && ShouldReportTimelineClip(clip.CharacterId))
+                {
+                    ReportTimelineControl("dynamic wrap char=" + clip.CharacterId +
+                        " serial=" + clip.Serial + " frames=" + frameCount);
+                }
+
                 clip.ScriptObject.Set("_currentframe", clip.CurrentFrame + 1);
+                renderStateDirty = true;
                 ExecuteDynamicClipFrameActions(clip);
             }
         }
@@ -2547,7 +3152,23 @@ namespace OpenSWFUnity.Runtime
 
             foreach (StaticDisplayInstance instance in staticDisplayInstances.Values)
             {
-                if (instance == null || !instance.IsPlaying)
+                if (instance == null ||
+                    instance.LastSeenTimelineTick < timelineTickSerial - 1)
+                    continue;
+
+                // A clip can be created by the render traversal after the previous
+                // action pass. Keep it on frame 1 until ExecuteVisibleSpriteActions
+                // has actually run that frame's scripts once.
+                if (!instance.HasExecutedFrameActions)
+                    continue;
+
+                if (instance.FrameEnteredPending)
+                {
+                    instance.FrameEnteredPending = false;
+                    continue;
+                }
+
+                if (!instance.IsPlaying)
                     continue;
 
                 DefineSpriteTag sprite = runtimeParser.FindSpriteById(instance.CharacterId);
@@ -2563,12 +3184,33 @@ namespace OpenSWFUnity.Runtime
                         ? 0
                         : sprite.Frames.Count - 1;
 
+                    if (sprite.Frames.Count >= TimelineDiagnosticMinFrames)
+                    {
+                        ReportTimelineControl("static wrap char=" + instance.CharacterId +
+                            " serial=" + instance.Serial + " frames=" + sprite.Frames.Count +
+                            " loop=" + loopSpriteTimelines + " path=" + instance.Path);
+                    }
+
                     if (!loopSpriteTimelines)
                         instance.IsPlaying = false;
                 }
 
                 instance.ScriptObject.Set("_currentframe", instance.CurrentFrame + 1);
+                renderStateDirty = true;
             }
+        }
+
+        private static bool RequiresScriptInstance(SwfParser parser, ushort characterId)
+        {
+            if (parser == null || characterId == 0)
+                return false;
+
+            // Raw Shape and DefineText characters are display data, not MovieClips.
+            // Giving every one an AVM1 object made large SWFs dispatch enterFrame,
+            // mouse transforms and property work to thousands of inert shapes.
+            return parser.FindSpriteById(characterId) != null ||
+                   parser.FindButton2ById(characterId) != null ||
+                   parser.FindEditTextById(characterId) != null;
         }
 
         private void ExecuteDynamicClipFrameActions(DynamicMovieClip clip)
@@ -2638,6 +3280,8 @@ namespace OpenSWFUnity.Runtime
                     Avm1Float(next.ScriptObject.Get("_alpha"), 100f) / 100f
                 );
 
+                RenderAttachedBitmaps(next.ScriptObject, worldMatrix, alpha);
+
                 if (next.CharacterId != 0 && alpha > 0.001f)
                 {
                     RenderCharacterDebug(
@@ -2668,6 +3312,40 @@ namespace OpenSWFUnity.Runtime
                         recursionDepth + 1
                     );
                 }
+            }
+        }
+
+        private void RenderAttachedBitmaps(
+            Avm1Object owner,
+            SwfMatrix worldMatrix,
+            float alpha)
+        {
+            if (owner == null || alpha <= 0.001f || runtimeRasterRenderer == null ||
+                !attachedBitmaps.TryGetValue(owner, out List<AttachedBitmap> attachments))
+            {
+                return;
+            }
+
+            for (int i = 0; i < attachments.Count; i++)
+            {
+                DynamicBitmapData bitmap = attachments[i]?.Bitmap;
+
+                if (bitmap == null || bitmap.Disposed || bitmap.Texture == null)
+                    continue;
+
+                if (bitmap.Dirty)
+                {
+                    bitmap.Texture.SetPixels32(bitmap.Pixels);
+                    bitmap.Texture.Apply(false, false);
+                    bitmap.Dirty = false;
+                }
+
+                runtimeRasterRenderer.DrawTextureQuad(
+                    bitmap.Texture,
+                    bitmap.Width,
+                    bitmap.Height,
+                    worldMatrix,
+                    alpha);
             }
         }
 
@@ -2922,7 +3600,33 @@ namespace OpenSWFUnity.Runtime
             }
 
             scriptObject.Set(isWidth ? "_xscale" : "_yscale", (double)(requested / extent * 100f));
+            renderStateDirty = true;
             return true;
+        }
+
+        private void HandleAvm1MemberChanged(Avm1Object scriptObject, string memberName)
+        {
+            if (scriptObject == null || string.IsNullOrEmpty(memberName))
+                return;
+
+            // Ordinary variables do not affect pixels. Marking every assignment dirty
+            // defeats retained frames in script-heavy games, so only display properties
+            // that the renderer consumes request a new mesh upload.
+            switch (memberName.ToLowerInvariant())
+            {
+                case "_x":
+                case "_y":
+                case "_xscale":
+                case "_yscale":
+                case "_rotation":
+                case "_alpha":
+                case "_visible":
+                case "_width":
+                case "_height":
+                case "text":
+                    renderStateDirty = true;
+                    break;
+            }
         }
 
         private bool TryGetDisplayObjectCharacter(Avm1Object scriptObject, out ushort characterId)
@@ -2970,6 +3674,8 @@ namespace OpenSWFUnity.Runtime
             if (receiver == runtimeAvm1?.RootObject)
             {
                 autoPlayTimeline = playing;
+                ReportTimelineControl("root " + (playing ? "play" : "stop") +
+                    " frame=" + (currentTimelineFrame + 1));
                 return;
             }
 
@@ -2977,6 +3683,12 @@ namespace OpenSWFUnity.Runtime
                 dynamicMovieClipsByObject.TryGetValue(scriptObject, out DynamicMovieClip clip))
             {
                 clip.IsPlaying = playing;
+                if (ShouldReportTimelineClip(clip.CharacterId))
+                {
+                    ReportTimelineControl("dynamic " + (playing ? "play" : "stop") +
+                        " char=" + clip.CharacterId + " serial=" + clip.Serial +
+                        " frame=" + (clip.CurrentFrame + 1));
+                }
                 return;
             }
 
@@ -2984,7 +3696,18 @@ namespace OpenSWFUnity.Runtime
                 staticDisplayInstancesByObject.TryGetValue(staticObject, out StaticDisplayInstance staticInstance))
             {
                 staticInstance.IsPlaying = playing;
+                if (ShouldReportTimelineClip(staticInstance.CharacterId))
+                {
+                    ReportTimelineControl("static " + (playing ? "play" : "stop") +
+                        " char=" + staticInstance.CharacterId + " serial=" + staticInstance.Serial +
+                        " frame=" + (staticInstance.CurrentFrame + 1) +
+                        " path=" + staticInstance.Path);
+                }
+                return;
             }
+
+            ReportTimelineControl("unresolved " + (playing ? "play" : "stop") +
+                " receiver=" + DescribeTimelineReceiver(receiver));
         }
 
         private void StepDynamicClip(object receiver, int direction)
@@ -2993,6 +3716,10 @@ namespace OpenSWFUnity.Runtime
             {
                 int frameCount = Mathf.Max(1, runtimeParser.RootFrames.Count);
                 currentTimelineFrame = (currentTimelineFrame + direction + frameCount) % frameCount;
+                rootFrameEnteredPending = true;
+                renderStateDirty = true;
+                ReportTimelineControl("root step direction=" + direction +
+                    " frame=" + (currentTimelineFrame + 1));
                 return;
             }
 
@@ -3002,6 +3729,10 @@ namespace OpenSWFUnity.Runtime
                 int frameCount = GetCharacterFrameCount(clip.CharacterId);
                 clip.CurrentFrame = (clip.CurrentFrame + direction + frameCount) % frameCount;
                 clip.ScriptObject.Set("_currentframe", clip.CurrentFrame + 1);
+                renderStateDirty = true;
+                ReportTimelineControl("dynamic step direction=" + direction +
+                    " char=" + clip.CharacterId + " serial=" + clip.Serial +
+                    " frame=" + (clip.CurrentFrame + 1));
                 ExecuteDynamicClipFrameActions(clip);
                 return;
             }
@@ -3012,8 +3743,53 @@ namespace OpenSWFUnity.Runtime
                 int frameCount = GetCharacterFrameCount(staticInstance.CharacterId);
                 staticInstance.CurrentFrame =
                     (staticInstance.CurrentFrame + direction + frameCount) % frameCount;
+                staticInstance.FrameEnteredPending = true;
                 staticInstance.ScriptObject.Set("_currentframe", staticInstance.CurrentFrame + 1);
+                renderStateDirty = true;
+                if (ShouldReportTimelineClip(staticInstance.CharacterId))
+                {
+                    ReportTimelineControl("static step direction=" + direction +
+                        " char=" + staticInstance.CharacterId + " serial=" + staticInstance.Serial +
+                        " frame=" + (staticInstance.CurrentFrame + 1) +
+                        " path=" + staticInstance.Path);
+                }
+                return;
             }
+
+            ReportTimelineControl("unresolved step direction=" + direction +
+                " receiver=" + DescribeTimelineReceiver(receiver));
+        }
+
+        private void ReportTimelineControl(string message)
+        {
+            if (!enableTimelineControlDiagnostics ||
+                timelineControlDiagnosticCount >= MaxTimelineControlDiagnostics)
+            {
+                return;
+            }
+
+            timelineControlDiagnosticCount++;
+            Debug.Log("[SWF timeline] " + message);
+        }
+
+        private bool ShouldReportTimelineClip(ushort characterId)
+        {
+            return GetCharacterFrameCount(characterId) >= TimelineDiagnosticMinFrames;
+        }
+
+        private static string DescribeTimelineReceiver(object receiver)
+        {
+            if (receiver == null)
+                return "null";
+
+            if (receiver is Avm1Object avm1Object)
+            {
+                return "Avm1Object target=" + (avm1Object.Get("_target") ?? "<none>") +
+                    " name=" + (avm1Object.Get("_name") ?? "<none>") +
+                    " char=" + (avm1Object.Get("__characterId") ?? "<none>");
+            }
+
+            return receiver.GetType().Name;
         }
 
         private void SetDynamicClipFrame(
@@ -3033,6 +3809,10 @@ namespace OpenSWFUnity.Runtime
                     Mathf.Max(0, runtimeParser.RootFrames.Count - 1)
                 );
                 autoPlayTimeline = playing;
+                rootFrameEnteredPending = true;
+                renderStateDirty = true;
+                ReportTimelineControl("root goto frame=" + (currentTimelineFrame + 1) +
+                    " playing=" + playing);
                 return;
             }
 
@@ -3046,6 +3826,10 @@ namespace OpenSWFUnity.Runtime
                 );
                 clip.IsPlaying = playing;
                 clip.ScriptObject.Set("_currentframe", clip.CurrentFrame + 1);
+                renderStateDirty = true;
+                ReportTimelineControl("dynamic goto char=" + clip.CharacterId +
+                    " serial=" + clip.Serial + " frame=" + (clip.CurrentFrame + 1) +
+                    " playing=" + playing);
                 ExecuteDynamicClipFrameActions(clip);
                 return;
             }
@@ -3059,8 +3843,22 @@ namespace OpenSWFUnity.Runtime
                     GetCharacterFrameCount(staticInstance.CharacterId) - 1
                 );
                 staticInstance.IsPlaying = playing;
+                staticInstance.FrameEnteredPending = true;
                 staticInstance.ScriptObject.Set("_currentframe", staticInstance.CurrentFrame + 1);
+                renderStateDirty = true;
+                if (ShouldReportTimelineClip(staticInstance.CharacterId))
+                {
+                    ReportTimelineControl("static goto char=" + staticInstance.CharacterId +
+                        " serial=" + staticInstance.Serial + " frame=" +
+                        (staticInstance.CurrentFrame + 1) + " playing=" + playing +
+                        " path=" + staticInstance.Path);
+                }
+                return;
             }
+
+            ReportTimelineControl("unresolved goto requested=" + requestedValue +
+                " resolvedFrame=" + (requestedFrame + 1) + " playing=" + playing +
+                " receiver=" + DescribeTimelineReceiver(receiver));
         }
 
         private int ResolveTimelineFrame(object receiver, object requestedValue)
@@ -3085,6 +3883,12 @@ namespace OpenSWFUnity.Runtime
             if (requestedValue is string label &&
                 !int.TryParse(label, out int numericLabel) && frames != null)
             {
+                if (receiver == runtimeAvm1?.RootObject &&
+                    runtimeParser.RootFrameLabels.TryGetValue(label, out int taggedFrame))
+                {
+                    return Mathf.Clamp(taggedFrame, 0, Mathf.Max(0, frames.Count - 1));
+                }
+
                 for (int frameIndex = 0; frameIndex < frames.Count; frameIndex++)
                 {
                     List<SwfTag> tags = frames[frameIndex].ControlTags;
@@ -3134,11 +3938,13 @@ namespace OpenSWFUnity.Runtime
                 otherClip.Depth = depth;
                 clip.ScriptObject.Set("_depth", clip.Depth);
                 otherClip.ScriptObject.Set("_depth", otherClip.Depth);
+                renderStateDirty = true;
             }
             else
             {
                 clip.Depth = ArgumentInt(arguments, 0, clip.Depth);
                 clip.ScriptObject.Set("_depth", clip.Depth);
+                renderStateDirty = true;
             }
         }
 
@@ -3193,6 +3999,256 @@ namespace OpenSWFUnity.Runtime
             return Mathf.Abs(Avm1Float(value, fallback ? 1f : 0f)) > 0.0001f;
         }
 
+        private static uint Avm1UInt(object value, uint fallback)
+        {
+            if (value == null)
+                return fallback;
+
+            try
+            {
+                return System.Convert.ToUInt32(
+                    System.Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture)
+                );
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        private Avm1Object CreateGeometryObject(
+            IReadOnlyList<object> arguments,
+            params string[] members)
+        {
+            Avm1Object result = runtimeAvm1.CreateObject();
+
+            for (int i = 0; i < members.Length; i++)
+                result.Set(members[i], i < arguments.Count ? arguments[i] : 0d);
+
+            return result;
+        }
+
+        private Avm1Object CreateMatrixObject(IReadOnlyList<object> arguments)
+        {
+            Avm1Object matrix = runtimeAvm1.CreateObject();
+            matrix.Set("a", arguments.Count > 0 ? arguments[0] : 1d);
+            matrix.Set("b", arguments.Count > 1 ? arguments[1] : 0d);
+            matrix.Set("c", arguments.Count > 2 ? arguments[2] : 0d);
+            matrix.Set("d", arguments.Count > 3 ? arguments[3] : 1d);
+            matrix.Set("tx", arguments.Count > 4 ? arguments[4] : 0d);
+            matrix.Set("ty", arguments.Count > 5 ? arguments[5] : 0d);
+            matrix.Set("translate", new Avm1NativeFunction(args =>
+            {
+                matrix.Set("tx", Avm1Float(matrix.Get("tx"), 0f) + Avm1Float(args.Count > 0 ? args[0] : null, 0f));
+                matrix.Set("ty", Avm1Float(matrix.Get("ty"), 0f) + Avm1Float(args.Count > 1 ? args[1] : null, 0f));
+                return matrix;
+            }));
+            matrix.Set("scale", new Avm1NativeFunction(args =>
+            {
+                float sx = Avm1Float(args.Count > 0 ? args[0] : null, 1f);
+                float sy = Avm1Float(args.Count > 1 ? args[1] : null, sx);
+                matrix.Set("a", Avm1Float(matrix.Get("a"), 1f) * sx);
+                matrix.Set("b", Avm1Float(matrix.Get("b"), 0f) * sy);
+                matrix.Set("c", Avm1Float(matrix.Get("c"), 0f) * sx);
+                matrix.Set("d", Avm1Float(matrix.Get("d"), 1f) * sy);
+                matrix.Set("tx", Avm1Float(matrix.Get("tx"), 0f) * sx);
+                matrix.Set("ty", Avm1Float(matrix.Get("ty"), 0f) * sy);
+                return matrix;
+            }));
+            matrix.Set("identity", new Avm1NativeFunction(_ =>
+            {
+                matrix.Set("a", 1d); matrix.Set("b", 0d);
+                matrix.Set("c", 0d); matrix.Set("d", 1d);
+                matrix.Set("tx", 0d); matrix.Set("ty", 0d);
+                return matrix;
+            }));
+            return matrix;
+        }
+
+        private static Color32 ArgbToColor(uint argb, bool transparent)
+        {
+            byte alpha = transparent ? (byte)(argb >> 24) : (byte)255;
+            return new Color32(
+                (byte)(argb >> 16),
+                (byte)(argb >> 8),
+                (byte)argb,
+                alpha);
+        }
+
+        private Avm1Object CreateBitmapDataObject(IReadOnlyList<object> arguments)
+        {
+            int width = Mathf.Clamp(ArgumentInt(arguments, 0, 1), 1, 4096);
+            int height = Mathf.Clamp(ArgumentInt(arguments, 1, 1), 1, 4096);
+            bool transparent = arguments.Count <= 2 || Avm1Boolean(arguments[2], true);
+            uint fillValue = arguments.Count > 3
+                ? Avm1UInt(arguments[3], 0xFFFFFFFFu)
+                : 0xFFFFFFFFu;
+            Color32 fill = ArgbToColor(fillValue, transparent);
+            Color32[] pixels = new Color32[width * height];
+
+            for (int i = 0; i < pixels.Length; i++)
+                pixels[i] = fill;
+
+            Texture2D texture = new Texture2D(width, height, TextureFormat.RGBA32, false)
+            {
+                name = "AVM1 BitmapData " + width + "x" + height,
+                filterMode = SwfRenderQuality.Settings.BitmapFilter,
+                wrapMode = TextureWrapMode.Clamp,
+                hideFlags = HideFlags.HideAndDontSave
+            };
+            texture.SetPixels32(pixels);
+            texture.Apply(false, false);
+
+            Avm1Object scriptObject = runtimeAvm1.CreateObject();
+            DynamicBitmapData bitmap = new DynamicBitmapData
+            {
+                ScriptObject = scriptObject,
+                Texture = texture,
+                Pixels = pixels,
+                Width = width,
+                Height = height,
+                Transparent = transparent
+            };
+            dynamicBitmapData[scriptObject] = bitmap;
+            scriptObject.Set("width", width);
+            scriptObject.Set("height", height);
+            scriptObject.Set("transparent", transparent);
+            scriptObject.Set("rectangle", CreateGeometryObject(
+                new object[] { 0d, 0d, (double)width, (double)height },
+                "x", "y", "width", "height"));
+            scriptObject.Set("fillRect", new Avm1NativeFunction(args =>
+            {
+                FillBitmapRect(bitmap, args.Count > 0 ? args[0] as Avm1Object : null,
+                    args.Count > 1 ? Avm1UInt(args[1], 0u) : 0u);
+                return true;
+            }));
+            scriptObject.Set("setPixel", new Avm1NativeFunction(args =>
+            {
+                SetBitmapPixel(bitmap, ArgumentInt(args, 0, 0), ArgumentInt(args, 1, 0),
+                    args.Count > 2 ? Avm1UInt(args[2], 0u) | 0xFF000000u : 0xFF000000u);
+                return true;
+            }));
+            scriptObject.Set("setPixel32", new Avm1NativeFunction(args =>
+            {
+                SetBitmapPixel(bitmap, ArgumentInt(args, 0, 0), ArgumentInt(args, 1, 0),
+                    args.Count > 2 ? Avm1UInt(args[2], 0u) : 0u);
+                return true;
+            }));
+            scriptObject.Set("getPixel", new Avm1NativeFunction(args =>
+                GetBitmapPixel(bitmap, ArgumentInt(args, 0, 0), ArgumentInt(args, 1, 0), false)));
+            scriptObject.Set("getPixel32", new Avm1NativeFunction(args =>
+                GetBitmapPixel(bitmap, ArgumentInt(args, 0, 0), ArgumentInt(args, 1, 0), true)));
+            scriptObject.Set("copyPixels", new Avm1NativeFunction(args =>
+            {
+                CopyBitmapPixels(
+                    bitmap,
+                    args.Count > 0 && args[0] is Avm1Object sourceObject &&
+                        dynamicBitmapData.TryGetValue(sourceObject, out DynamicBitmapData source)
+                            ? source
+                            : null,
+                    args.Count > 1 ? args[1] as Avm1Object : null,
+                    args.Count > 2 ? args[2] as Avm1Object : null);
+                return true;
+            }));
+            scriptObject.Set("draw", new Avm1NativeFunction(args =>
+            {
+                if (args.Count > 0 && args[0] is Avm1Object sourceObject &&
+                    dynamicBitmapData.TryGetValue(sourceObject, out DynamicBitmapData source))
+                {
+                    CopyBitmapPixels(bitmap, source, null, null);
+                }
+                return true;
+            }));
+            scriptObject.Set("lock", new Avm1NativeFunction(_ => true));
+            scriptObject.Set("unlock", new Avm1NativeFunction(_ =>
+            {
+                bitmap.Dirty = true;
+                renderStateDirty = true;
+                return true;
+            }));
+            scriptObject.Set("dispose", new Avm1NativeFunction(_ =>
+            {
+                bitmap.Disposed = true;
+                renderStateDirty = true;
+                return true;
+            }));
+            return scriptObject;
+        }
+
+        private static int BitmapIndex(DynamicBitmapData bitmap, int x, int y)
+        {
+            if (bitmap == null || x < 0 || y < 0 || x >= bitmap.Width || y >= bitmap.Height)
+                return -1;
+            return (bitmap.Height - 1 - y) * bitmap.Width + x;
+        }
+
+        private void SetBitmapPixel(DynamicBitmapData bitmap, int x, int y, uint argb)
+        {
+            int index = BitmapIndex(bitmap, x, y);
+            if (index < 0) return;
+            bitmap.Pixels[index] = ArgbToColor(argb, bitmap.Transparent);
+            bitmap.Dirty = true;
+            renderStateDirty = true;
+        }
+
+        private static uint GetBitmapPixel(DynamicBitmapData bitmap, int x, int y, bool includeAlpha)
+        {
+            int index = BitmapIndex(bitmap, x, y);
+            if (index < 0) return 0u;
+            Color32 color = bitmap.Pixels[index];
+            uint rgb = ((uint)color.r << 16) | ((uint)color.g << 8) | color.b;
+            return includeAlpha ? ((uint)color.a << 24) | rgb : rgb;
+        }
+
+        private void FillBitmapRect(DynamicBitmapData bitmap, Avm1Object rectangle, uint argb)
+        {
+            if (bitmap == null || bitmap.Disposed) return;
+            int x = rectangle != null ? Mathf.FloorToInt(Avm1Float(rectangle.Get("x"), 0f)) : 0;
+            int y = rectangle != null ? Mathf.FloorToInt(Avm1Float(rectangle.Get("y"), 0f)) : 0;
+            int width = rectangle != null ? Mathf.CeilToInt(Avm1Float(rectangle.Get("width"), bitmap.Width)) : bitmap.Width;
+            int height = rectangle != null ? Mathf.CeilToInt(Avm1Float(rectangle.Get("height"), bitmap.Height)) : bitmap.Height;
+            int x0 = Mathf.Clamp(x, 0, bitmap.Width);
+            int y0 = Mathf.Clamp(y, 0, bitmap.Height);
+            int x1 = Mathf.Clamp(x + width, 0, bitmap.Width);
+            int y1 = Mathf.Clamp(y + height, 0, bitmap.Height);
+            Color32 color = ArgbToColor(argb, bitmap.Transparent);
+
+            for (int py = y0; py < y1; py++)
+            for (int px = x0; px < x1; px++)
+                bitmap.Pixels[BitmapIndex(bitmap, px, py)] = color;
+
+            bitmap.Dirty = true;
+            renderStateDirty = true;
+        }
+
+        private void CopyBitmapPixels(
+            DynamicBitmapData destination,
+            DynamicBitmapData source,
+            Avm1Object sourceRectangle,
+            Avm1Object destinationPoint)
+        {
+            if (destination == null || source == null || destination.Disposed || source.Disposed)
+                return;
+            int sourceX = sourceRectangle != null ? Mathf.FloorToInt(Avm1Float(sourceRectangle.Get("x"), 0f)) : 0;
+            int sourceY = sourceRectangle != null ? Mathf.FloorToInt(Avm1Float(sourceRectangle.Get("y"), 0f)) : 0;
+            int width = sourceRectangle != null ? Mathf.CeilToInt(Avm1Float(sourceRectangle.Get("width"), source.Width)) : source.Width;
+            int height = sourceRectangle != null ? Mathf.CeilToInt(Avm1Float(sourceRectangle.Get("height"), source.Height)) : source.Height;
+            int destinationX = destinationPoint != null ? Mathf.FloorToInt(Avm1Float(destinationPoint.Get("x"), 0f)) : 0;
+            int destinationY = destinationPoint != null ? Mathf.FloorToInt(Avm1Float(destinationPoint.Get("y"), 0f)) : 0;
+
+            for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+            {
+                int sourceIndex = BitmapIndex(source, sourceX + x, sourceY + y);
+                int destinationIndex = BitmapIndex(destination, destinationX + x, destinationY + y);
+                if (sourceIndex >= 0 && destinationIndex >= 0)
+                    destination.Pixels[destinationIndex] = source.Pixels[sourceIndex];
+            }
+
+            destination.Dirty = true;
+            renderStateDirty = true;
+        }
+
         private object HandleAvm1ExternalMethod(
             object receiver,
             string functionName,
@@ -3203,6 +4259,24 @@ namespace OpenSWFUnity.Runtime
 
             switch (normalized)
             {
+                case "new:bitmapdata":
+                    return CreateBitmapDataObject(arguments);
+
+                case "new:rectangle":
+                    return CreateGeometryObject(arguments, "x", "y", "width", "height");
+
+                case "new:point":
+                    return CreateGeometryObject(arguments, "x", "y");
+
+                case "new:matrix":
+                    return CreateMatrixObject(arguments);
+
+                case "new:colortransform":
+                    return CreateGeometryObject(
+                        arguments,
+                        "redMultiplier", "greenMultiplier", "blueMultiplier", "alphaMultiplier",
+                        "redOffset", "greenOffset", "blueOffset", "alphaOffset");
+
                 case "new:sound":
                 {
                     Avm1Object sound = runtimeAvm1.CreateObject();
@@ -3219,6 +4293,7 @@ namespace OpenSWFUnity.Runtime
                     }));
                     sound.Set("stop", new Avm1NativeFunction(args =>
                     {
+                        ReportTimelineControl("audio Sound.stop()");
                         runtimeAudio?.StopAll();
                         return true;
                     }));
@@ -3274,6 +4349,36 @@ namespace OpenSWFUnity.Runtime
                         true
                     );
 
+                case "attachbitmap":
+                {
+                    if (!(receiver is Avm1Object owner) || arguments.Count == 0 ||
+                        !(arguments[0] is Avm1Object bitmapObject) ||
+                        !dynamicBitmapData.TryGetValue(bitmapObject, out DynamicBitmapData bitmap))
+                    {
+                        return false;
+                    }
+
+                    int depth = ArgumentInt(arguments, 1, 0);
+                    bool smoothing = arguments.Count > 3 && Avm1Boolean(arguments[3], false);
+                    bitmap.Texture.filterMode = smoothing
+                        ? FilterMode.Bilinear
+                        : SwfRenderQuality.Settings.BitmapFilter;
+
+                    if (!attachedBitmaps.TryGetValue(owner, out List<AttachedBitmap> attachments))
+                    {
+                        attachments = new List<AttachedBitmap>();
+                        attachedBitmaps[owner] = attachments;
+                    }
+
+                    for (int i = attachments.Count - 1; i >= 0; i--)
+                        if (attachments[i].Depth == depth) attachments.RemoveAt(i);
+
+                    attachments.Add(new AttachedBitmap { Bitmap = bitmap, Depth = depth });
+                    attachments.Sort((left, right) => left.Depth.CompareTo(right.Depth));
+                    renderStateDirty = true;
+                    return true;
+                }
+
                 case "duplicatemovieclip":
                 {
                     if (!(receiver is Avm1Object receiverObject))
@@ -3321,6 +4426,14 @@ namespace OpenSWFUnity.Runtime
                 case "gettimer":
                     return Mathf.RoundToInt(Time.realtimeSinceStartup * 1000f);
 
+                case "getbytesloaded":
+                case "getbytestotal":
+                    // OpenSWFUnity currently loads a local byte array atomically, so
+                    // there is no streaming interval during which these can differ.
+                    // Returning the real asset size lets generic Flash preloaders
+                    // leave their splash screen without game-specific exceptions.
+                    return swfFile?.bytes != null ? (double)swfFile.bytes.LongLength : 0d;
+
                 case "random":
                 {
                     // AVM1 coerces the argument to a number rather than failing on
@@ -3338,6 +4451,7 @@ namespace OpenSWFUnity.Runtime
                     return null;
 
                 case "stopsounds":
+                    ReportTimelineControl("audio stopSounds opcode");
                     runtimeAudio?.StopAll();
                     return true;
 
@@ -3369,6 +4483,8 @@ namespace OpenSWFUnity.Runtime
 
                         if (staticDisplayInstancesByObject.TryGetValue(maskedObject, out StaticDisplayInstance staticMaskedClip))
                             staticMaskedClip.MaskObject = assignedMask;
+
+                        renderStateDirty = true;
                     }
                     return true;
 
@@ -3385,30 +4501,21 @@ namespace OpenSWFUnity.Runtime
                     return true;
 
                 case "gotoframe":
-                {
-                    bool isPlaying = receiver == runtimeAvm1?.RootObject
-                        ? autoPlayTimeline
-                        : receiver is Avm1Object frameObject &&
-                          dynamicMovieClipsByObject.TryGetValue(frameObject, out DynamicMovieClip frameClip) &&
-                          frameClip.IsPlaying;
-                    SetDynamicClipFrame(receiver, arguments, isPlaying);
+                    // The legacy ActionGotoFrame opcode is a goto-and-stop action.
+                    // ActionGotoFrame2 carries the separate Play flag and is decoded
+                    // above as either gotoAndPlay or gotoAndStop. Preserving the old
+                    // play state here makes multi-frame scene containers run through
+                    // every cave/menu image after selecting a single destination.
+                    SetDynamicClipFrame(receiver, arguments, false);
                     return true;
-                }
 
                 case "swapdepths":
                     SwapDynamicClipDepth(receiver, arguments);
                     return true;
 
                 case "gotolabel":
-                {
-                    bool isPlaying = receiver == runtimeAvm1?.RootObject
-                        ? autoPlayTimeline
-                        : receiver is Avm1Object labelObject &&
-                          dynamicMovieClipsByObject.TryGetValue(labelObject, out DynamicMovieClip labelClip) &&
-                          labelClip.IsPlaying;
-                    SetDynamicClipFrame(receiver, arguments, isPlaying);
+                    SetDynamicClipFrame(receiver, arguments, false);
                     return true;
-                }
                 case "call":
                 case "startdrag":
                 case "stopdrag":
@@ -3451,9 +4558,6 @@ namespace OpenSWFUnity.Runtime
             int frameIndex
         )
         {
-            Dictionary<ushort, PlaceObject2Tag> activeByDepth =
-                new Dictionary<ushort, PlaceObject2Tag>();
-
             if (frames == null || frames.Count == 0)
                 return new List<PlaceObject2Tag>();
 
@@ -3473,140 +4577,161 @@ namespace OpenSWFUnity.Runtime
             if (framesCache.TryGetValue(maxFrame, out List<PlaceObject2Tag> cached))
                 return cached;
 
-            for (int f = 0; f <= maxFrame; f++)
+            Dictionary<ushort, PlaceObject2Tag> activeByDepth =
+                new Dictionary<ushort, PlaceObject2Tag>();
+            int firstFrameToReplay = 0;
+
+            // Timeline playback normally asks for N immediately after N-1. Start
+            // from that immutable snapshot instead of replaying frames 0..N for
+            // every new frame. This turns a long sprite timeline from O(n^2) tag
+            // parsing into O(n), which removes the periodic first-visit stalls in
+            // games containing thousands of nested sprites.
+            for (int previous = maxFrame - 1; previous >= 0; previous--)
+            {
+                if (!framesCache.TryGetValue(previous, out List<PlaceObject2Tag> snapshot))
+                    continue;
+
+                for (int i = 0; i < snapshot.Count; i++)
+                    activeByDepth[snapshot[i].Depth] = snapshot[i];
+
+                firstFrameToReplay = previous + 1;
+                break;
+            }
+
+            for (int f = firstFrameToReplay; f <= maxFrame; f++)
             {
                 SwfFrame frame = frames[f];
 
-                if (frame == null || frame.ControlTags == null)
-                    continue;
-
-                for (int t = 0; t < frame.ControlTags.Count; t++)
+                if (frame != null && frame.ControlTags != null)
                 {
-                    SwfTag tag = frame.ControlTags[t];
-
-                    if (tag == null)
-                        continue;
-
-                    if (tag.Code == 26 || tag.Code == 70) // PlaceObject2 / PlaceObject3
+                    for (int t = 0; t < frame.ControlTags.Count; t++)
                     {
-                        PlaceObject2Tag place = parser.ParsePlaceObject2FromTag(tag);
+                        SwfTag tag = frame.ControlTags[t];
 
-                        if (place == null)
+                        if (tag == null)
                             continue;
 
-                        if (activeByDepth.TryGetValue(place.Depth, out PlaceObject2Tag existing))
+                        if (tag.Code == 26 || tag.Code == 70) // PlaceObject2 / PlaceObject3
                         {
-                            bool isMoveUpdate =
-                                !place.HasCharacter ||
-                                place.CharacterId == 0;
+                            PlaceObject2Tag place = parser.ParsePlaceObject2FromTag(tag);
 
-                            if (isMoveUpdate)
+                            if (place == null)
+                                continue;
+
+                            if (activeByDepth.TryGetValue(place.Depth, out PlaceObject2Tag existing))
                             {
-                                place.CharacterId = existing.CharacterId;
-                                place.HasCharacter = existing.HasCharacter;
-                                place.TimelineStartFrame = existing.TimelineStartFrame;
+                                bool isMoveUpdate =
+                                    !place.HasCharacter ||
+                                    place.CharacterId == 0;
 
-                                if (!place.HasMatrix)
+                                if (isMoveUpdate)
                                 {
-                                    place.Matrix = existing.Matrix;
-                                    place.HasMatrix = existing.HasMatrix;
+                                    place.CharacterId = existing.CharacterId;
+                                    place.HasCharacter = existing.HasCharacter;
+                                    place.TimelineStartFrame = existing.TimelineStartFrame;
+
+                                    if (!place.HasMatrix)
+                                    {
+                                        place.Matrix = existing.Matrix;
+                                        place.HasMatrix = existing.HasMatrix;
+                                    }
+
+                                    if (!place.HasColorTransform)
+                                    {
+                                        place.ColorTransform = existing.ColorTransform;
+                                        place.HasColorTransform = existing.HasColorTransform;
+                                    }
+
+                                    if (!place.HasRatio)
+                                    {
+                                        place.Ratio = existing.Ratio;
+                                        place.HasRatio = existing.HasRatio;
+                                    }
+
+                                    if (!place.HasName)
+                                    {
+                                        place.Name = existing.Name;
+                                        place.HasName = existing.HasName;
+                                    }
+
+                                    if (!place.HasClipDepth)
+                                    {
+                                        place.ClipDepth = existing.ClipDepth;
+                                        place.HasClipDepth = existing.HasClipDepth;
+                                    }
+
+                                    if (!place.HasClipActions)
+                                    {
+                                        place.ClipActions = existing.ClipActions;
+                                        place.HasClipActions = existing.HasClipActions;
+                                    }
+
+                                    if (!place.HasVisible)
+                                    {
+                                        place.Visible = existing.Visible;
+                                        place.HasVisible = existing.HasVisible;
+                                    }
+
+                                    if (!place.HasBlendMode)
+                                    {
+                                        place.BlendMode = existing.BlendMode;
+                                        place.HasBlendMode = existing.HasBlendMode;
+                                    }
+
+                                    if (!place.HasClassName)
+                                    {
+                                        place.ClassName = existing.ClassName;
+                                        place.HasClassName = existing.HasClassName;
+                                    }
+                                }
+                                else
+                                {
+                                    place.TimelineStartFrame = f;
                                 }
 
-                                if (!place.HasColorTransform)
-                                {
-                                    place.ColorTransform = existing.ColorTransform;
-                                    place.HasColorTransform = existing.HasColorTransform;
-                                }
+                                // IMPORTANT:
+                                // Even if this is a new/replaced character, Flash may omit Matrix.
+                                // In that case, keep previous depth matrix instead of using default/identity.
+                                // if (!place.HasMatrix)
+                                // {
+                                //     place.Matrix = existing.Matrix;
+                                //     place.HasMatrix = existing.HasMatrix;
+                                // }
 
-                                if (!place.HasRatio)
-                                {
-                                    place.Ratio = existing.Ratio;
-                                    place.HasRatio = existing.HasRatio;
-                                }
-
-                                if (!place.HasName)
-                                {
-                                    place.Name = existing.Name;
-                                    place.HasName = existing.HasName;
-                                }
-
-                                if (!place.HasClipDepth)
-                                {
-                                    place.ClipDepth = existing.ClipDepth;
-                                    place.HasClipDepth = existing.HasClipDepth;
-                                }
-
-                                if (!place.HasClipActions)
-                                {
-                                    place.ClipActions = existing.ClipActions;
-                                    place.HasClipActions = existing.HasClipActions;
-                                }
-
-                                if (!place.HasVisible)
-                                {
-                                    place.Visible = existing.Visible;
-                                    place.HasVisible = existing.HasVisible;
-                                }
-
-                                if (!place.HasBlendMode)
-                                {
-                                    place.BlendMode = existing.BlendMode;
-                                    place.HasBlendMode = existing.HasBlendMode;
-                                }
-
-                                if (!place.HasClassName)
-                                {
-                                    place.ClassName = existing.ClassName;
-                                    place.HasClassName = existing.HasClassName;
-                                }
+                                // Do NOT inherit ColorTransform for a new character.
+                                // Only move/update tags inherit it above.
                             }
                             else
                             {
                                 place.TimelineStartFrame = f;
                             }
 
-                            // IMPORTANT:
-                            // Even if this is a new/replaced character, Flash may omit Matrix.
-                            // In that case, keep previous depth matrix instead of using default/identity.
-                            // if (!place.HasMatrix)
-                            // {
-                            //     place.Matrix = existing.Matrix;
-                            //     place.HasMatrix = existing.HasMatrix;
-                            // }
-
-                            // Do NOT inherit ColorTransform for a new character.
-                            // Only move/update tags inherit it above.
+                            activeByDepth[place.Depth] = place;
                         }
-                        else
+                        else if (tag.Code == 5) // RemoveObject
                         {
-                            place.TimelineStartFrame = f;
+                            ushort depth = parser.ParseRemoveObjectDepthFromTag(tag);
+
+                            if (activeByDepth.ContainsKey(depth))
+                                activeByDepth.Remove(depth);
                         }
+                        else if (tag.Code == 28) // RemoveObject2
+                        {
+                            ushort depth = parser.ParseRemoveObject2DepthFromTag(tag);
 
-                        activeByDepth[place.Depth] = place;
-                    }
-                    else if (tag.Code == 5) // RemoveObject
-                    {
-                        ushort depth = parser.ParseRemoveObjectDepthFromTag(tag);
-
-                        if (activeByDepth.ContainsKey(depth))
-                            activeByDepth.Remove(depth);
-                    }
-                    else if (tag.Code == 28) // RemoveObject2
-                    {
-                        ushort depth = parser.ParseRemoveObject2DepthFromTag(tag);
-
-                        if (activeByDepth.ContainsKey(depth))
-                            activeByDepth.Remove(depth);
+                            if (activeByDepth.ContainsKey(depth))
+                                activeByDepth.Remove(depth);
+                        }
                     }
                 }
+
+                List<PlaceObject2Tag> snapshot =
+                    new List<PlaceObject2Tag>(activeByDepth.Values);
+                snapshot.Sort((a, b) => a.Depth.CompareTo(b.Depth));
+                framesCache[f] = snapshot;
             }
 
-            List<PlaceObject2Tag> result = new List<PlaceObject2Tag>(activeByDepth.Values);
-
-            result.Sort((a, b) => a.Depth.CompareTo(b.Depth));
-
-            framesCache[maxFrame] = result;
-            return result;
+            return framesCache[maxFrame];
         }
 
         private class ActiveButtonInstance
@@ -3628,9 +4753,13 @@ namespace OpenSWFUnity.Runtime
             public int Depth;
             public int CurrentFrame;
             public bool IsPlaying;
+            public bool FrameEnteredPending;
+            public bool HasExecutedFrameActions;
             public SwfMatrix TimelineMatrix;
             public bool TimelineVisible;
+            public int TimelineStartFrame;
             public long LastSeenTimelineTick;
+            public long Serial;
             public List<SwfClipActionRecord> ClipActions;
         }
 
@@ -3646,6 +4775,25 @@ namespace OpenSWFUnity.Runtime
             public int CurrentFrame;
             public bool IsPlaying;
             public bool Removed;
+            public long Serial;
+        }
+
+        private sealed class DynamicBitmapData
+        {
+            public Avm1Object ScriptObject;
+            public Texture2D Texture;
+            public Color32[] Pixels;
+            public int Width;
+            public int Height;
+            public bool Transparent;
+            public bool Dirty;
+            public bool Disposed;
+        }
+
+        private sealed class AttachedBitmap
+        {
+            public DynamicBitmapData Bitmap;
+            public int Depth;
         }
     }
 }

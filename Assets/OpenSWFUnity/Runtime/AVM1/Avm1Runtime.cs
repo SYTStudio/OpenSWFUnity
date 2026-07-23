@@ -9,22 +9,27 @@ namespace OpenSWFUnity.Runtime.AVM1
 {
     public sealed class Avm1Runtime : ISwfScriptRuntime
     {
-        // A real game's initialisation script legitimately runs far more than a
-        // demo's: 200k was low enough that Isaac-sized content tripped the guard
-        // during startup and silently stopped half-configured. Still bounded, so
-        // a genuinely runaway script cannot hang the Editor.
-        public const int DefaultInstructionBudget = 5000000;
+        // Large AVM1 games generate a complete level synchronously in one frame.
+        // A 5M ceiling cut valid generators off mid-script (leaving their UI/audio
+        // in the transition state). Large procedural games can execute a 3000-step
+        // room generator with nested neighbour checks during one frame; measured
+        // bytecode exceeds 50M instructions before it has built the HUD/display
+        // list. Keep a finite runaway-script guard, but leave enough headroom for
+        // legitimate synchronous game initialization.
+        public const int DefaultInstructionBudget = 200000000;
         private static readonly object Undefined = new object();
 
         private readonly StringComparer nameComparer;
         private readonly Dictionary<string, object> globals;
         private readonly Dictionary<string, object> registeredClasses;
+        private readonly Dictionary<string, Avm1Object> sharedObjects;
         private readonly HashSet<int> pressedKeys = new HashSet<int>();
         private readonly System.Random randomSource = new System.Random();
 
         public Avm1Object RootObject { get; }
         public Func<string, IReadOnlyList<object>, object> ExternalFunction { get; set; }
         public Func<object, string, IReadOnlyList<object>, object> ExternalMethod { get; set; }
+        public Action<Avm1Object, string> MemberChanged { get; set; }
         public Action<string> Trace { get; set; }
         public Action<string> Warning { get; set; }
         public int DefinedFunctionCount { get; private set; }
@@ -67,6 +72,7 @@ namespace OpenSWFUnity.Runtime.AVM1
             nameComparer = caseSensitive ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
             globals = new Dictionary<string, object>(nameComparer);
             registeredClasses = new Dictionary<string, object>(nameComparer);
+            sharedObjects = new Dictionary<string, Avm1Object>(nameComparer);
             RootObject = new Avm1Object(nameComparer);
             globals["_root"] = RootObject;
             globals["_level0"] = RootObject;
@@ -351,7 +357,11 @@ namespace OpenSWFUnity.Runtime.AVM1
                         ReportWarning(
                             "AVM1 instruction budget of " +
                             (InstructionBudget > 0 ? InstructionBudget : DefaultInstructionBudget) +
-                            " reached; script execution was stopped safely. The movie may be " +
+                            " reached at action offset " + p +
+                            " (next opcode 0x" + code[p].ToString("X2") +
+                            ", block " + start + ".." + end +
+                            ", stack=" + context.Stack.Count +
+                            "); script execution was stopped safely. The movie may be " +
                             "stuck in an infinite loop, or may need a higher ScriptLimits budget."
                         );
                     }
@@ -1332,7 +1342,14 @@ namespace OpenSWFUnity.Runtime.AVM1
             Dictionary<string, object> locals =
                 new Dictionary<string, object>(nameComparer);
             ExecutionContext context = RentContext(locals, function.ConstantPool, true);
-            object resolvedThis = thisObject ?? RootObject;
+            // The private Undefined sentinel is non-null, so null-coalescing alone
+            // incorrectly made it the function's `this` and timeline target. AVM1
+            // functions called without a receiver execute against their defining
+            // timeline (or _root when no defining target exists).
+            object resolvedThis =
+                thisObject == null || ReferenceEquals(thisObject, Undefined)
+                    ? function.DefiningTarget ?? RootObject
+                    : thisObject;
             context.Target = resolvedThis;
             context.OriginalTarget = resolvedThis;
             context.OuterLocals.AddRange(function.CapturedOuterLocals);
@@ -1765,6 +1782,69 @@ namespace OpenSWFUnity.Runtime.AVM1
             key.Set("isToggled", new Avm1NativeFunction(args => false));
             globals["Key"] = key;
 
+            // AS1/AS2 games commonly keep every progression flag in a local
+            // SharedObject. Returning undefined here does not merely lose saves:
+            // so.data writes are discarded and later unlock checks read undefined,
+            // which can send a game through unrelated cut-scene branches.
+            Avm1Object sharedObjectClass = CreateObject();
+            Avm1NativeFunction getLocal = new Avm1NativeFunction(args =>
+            {
+                string objectName = args != null && args.Count > 0
+                    ? ToAvm1String(args[0])
+                    : string.Empty;
+                string localPath = args != null && args.Count > 1
+                    ? ToAvm1String(args[1])
+                    : string.Empty;
+                string keyName = localPath + "\n" + objectName;
+
+                if (!sharedObjects.TryGetValue(keyName, out Avm1Object shared))
+                {
+                    shared = CreateObject();
+                    shared.Set("data", CreateObject());
+                    shared.Set("flush", new Avm1NativeFunction(_ => true));
+                    shared.Set("close", new Avm1NativeFunction(_ => true));
+                    shared.Set("getSize", new Avm1NativeFunction(_ => 0d));
+                    shared.Set("clear", new Avm1NativeFunction(_ =>
+                    {
+                        shared.Set("data", CreateObject());
+                        return true;
+                    }));
+                    sharedObjects[keyName] = shared;
+                }
+
+                return shared;
+            });
+            sharedObjectClass.Set("getLocal", getLocal);
+            sharedObjectClass.Set("getRemote", getLocal);
+            sharedObjectClass.Set("deleteAll", new Avm1NativeFunction(_ =>
+            {
+                sharedObjects.Clear();
+                return true;
+            }));
+            sharedObjectClass.Set("getDiskUsage", new Avm1NativeFunction(_ => 0d));
+            globals["SharedObject"] = sharedObjectClass;
+
+            // AS2 exposes these through package objects (flash.display.BitmapData,
+            // flash.geom.Rectangle, ...). Route construction to the player host so
+            // the VM remains platform-neutral while Unity can back BitmapData with
+            // a GPU texture.
+            Avm1Object flashPackage = CreateObject();
+            Avm1Object displayPackage = CreateObject();
+            Avm1Object geomPackage = CreateObject();
+            displayPackage.Set("BitmapData", new Avm1NativeFunction(args =>
+                InvokeExternal("new:BitmapData", args, displayPackage)));
+            geomPackage.Set("Rectangle", new Avm1NativeFunction(args =>
+                InvokeExternal("new:Rectangle", args, geomPackage)));
+            geomPackage.Set("Point", new Avm1NativeFunction(args =>
+                InvokeExternal("new:Point", args, geomPackage)));
+            geomPackage.Set("Matrix", new Avm1NativeFunction(args =>
+                InvokeExternal("new:Matrix", args, geomPackage)));
+            geomPackage.Set("ColorTransform", new Avm1NativeFunction(args =>
+                InvokeExternal("new:ColorTransform", args, geomPackage)));
+            flashPackage.Set("display", displayPackage);
+            flashPackage.Set("geom", geomPackage);
+            globals["flash"] = flashPackage;
+
             foreach (KeyValuePair<string, object> builtIn in globals)
             {
                 if (!RootObject.TryGetOwn(builtIn.Key, out _))
@@ -2057,7 +2137,7 @@ namespace OpenSWFUnity.Runtime.AVM1
 
                     if (scope != null && scope.TryGet(name, out _))
                     {
-                        scope.Set(name, value);
+                        SetMember(scope, name, value);
                         return;
                     }
                 }
@@ -2066,12 +2146,12 @@ namespace OpenSWFUnity.Runtime.AVM1
             if (context != null && context.Target is Avm1Object targetObject &&
                 targetObject != RootObject)
             {
-                targetObject.Set(name, value);
+                SetMember(targetObject, name, value);
                 return;
             }
 
             globals[name] = value;
-            RootObject.Set(name, value);
+            SetMember(RootObject, name, value);
         }
 
         private void DefineLocal(ExecutionContext context, string name, object value)
@@ -2836,6 +2916,7 @@ namespace OpenSWFUnity.Runtime.AVM1
                 }
 
                 avmObject.Set(name, value);
+                MemberChanged?.Invoke(avmObject, name);
                 return;
             }
 
